@@ -31,6 +31,12 @@ public final class AudioEngine {
     }
 
     /// Why a lane is not contributing to the mix.
+    ///
+    /// `deviceMissing` covers a process-tap lane whose tap could not be built
+    /// too — the app is not playing, or macOS refuses the capture. The two
+    /// cases are the same thing from the mixer's point of view (this lane's
+    /// source is not here right now), and the difference the user needs is the
+    /// sentence, which `laneStatusReason` carries.
     public enum LaneStatus: Equatable, Sendable {
         case ok
         case deviceMissing
@@ -82,6 +88,11 @@ public final class AudioEngine {
     public private(set) var restartCount = 0
     public private(set) var aggregateSummary: String?
     public private(set) var laneStatus: [UUID: LaneStatus] = [:]
+    /// One human-readable sentence for a lane whose `laneStatus` is a problem
+    /// and whose reason is not obvious from the status alone — today that is
+    /// every process-tap lane whose tap the HAL would not build. Absent for an
+    /// ordinary unplugged device, where "device missing" already says it.
+    public private(set) var laneStatusReason: [UUID: String] = [:]
     /// Per-lane effect chains, keyed by `LaneConfig.id`. An entry whose
     /// `unavailableReason` is set is a placeholder: it holds a plug-in's saved
     /// state so a session opened without that plug-in can be saved again
@@ -119,6 +130,19 @@ public final class AudioEngine {
         buses.first { $0.id == masterBusID }?.outputDeviceUID
     }
     public private(set) var microphoneAuthorized = false
+    /// The *other* capture permission: whether macOS lets Clapboard tap other
+    /// applications' audio. Separate from the microphone one in every way —
+    /// different TCC service, different Info.plist key
+    /// (`NSAudioCaptureUsageDescription`), and no `AVFoundation` API — see
+    /// `ProcessTapPermission` and `docs/PERMISSIONS.md`.
+    ///
+    /// Only consulted when a lane actually wants a tap: a microphone-only mix
+    /// must not be blocked by a permission it never uses.
+    public private(set) var systemAudioAuthorization: SystemAudioAuthorization = .notDetermined
+    /// Processes the HAL currently reports as candidates for a tap. Refreshed
+    /// by `refreshTappableProcesses()` and whenever the HAL's process list
+    /// changes, so the UI can read it without enumerating anything itself.
+    public private(set) var tappableProcesses: [TappableProcess] = []
 
     /// Opening and closing a plug-in's editor window is AppKit work, and
     /// `ClapboardCore` has no AppKit. The app wires these to
@@ -151,6 +175,11 @@ public final class AudioEngine {
     private var suspendedForSleep = false
     /// Shape of the devices the running graph depends on, captured at bring-up.
     private var dependencyFingerprint: [String] = []
+    /// HAL listener on `kAudioHardwarePropertyProcessObjectList`, registered
+    /// only while some lane wants an app tap. A tapped app quitting or
+    /// launching changes nothing about the *device* list, so hot-plug handling
+    /// would never notice it.
+    private var processListListener: AudioObjectPropertyListenerBlock?
     /// Watchdog only fires once the engine has actually seen a callback, so a
     /// slow-starting device is not mistaken for a dead one.
     private var sawFirstCallback = false
@@ -193,6 +222,14 @@ public final class AudioEngine {
         addLane(LaneConfig(deviceUID: deviceUID, deviceChannels: deviceChannels, name: name))
     }
 
+    /// Adds a lane fed by a process tap instead of an input device. Everything
+    /// downstream — meters, delay, effects, routing — is identical; only the
+    /// source differs.
+    @discardableResult
+    public func addTapLane(_ spec: TapSpec, name: String? = nil) -> LaneConfig {
+        addLane(LaneConfig(source: .processTap(spec), name: name ?? spec.name))
+    }
+
     /// Adds a lane whose identity is already decided — session restore, where
     /// keeping `LaneConfig.id` is what keeps per-lane data (M3 sync results,
     /// M4 plug-in state) attached to the right lane across a relaunch.
@@ -218,6 +255,7 @@ public final class AudioEngine {
         guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
         lanes.remove(at: index)
         laneStatus[id] = nil
+        laneStatusReason[id] = nil
         pdcSamples[id] = nil
         // The lane's plug-ins go the same way its runtime does: detached now,
         // freed once the render thread has left the snapshot that named them.
@@ -282,10 +320,15 @@ public final class AudioEngine {
     }
 
     public func setLaneSource(_ id: UUID, deviceUID: String, deviceChannels: [Int]) {
-        mutate(id) {
-            $0.deviceUID = deviceUID
-            $0.deviceChannels = Array(deviceChannels.prefix(2))
-        }
+        setLaneSource(id, .device(uid: deviceUID, channels: Array(deviceChannels.prefix(2))))
+    }
+
+    /// Re-points a lane at any source, device or tap. A tap the aggregate does
+    /// not already carry means a rebuild, which `applyTopologyChange` works
+    /// out for itself.
+    public func setLaneSource(_ id: UUID, _ source: LaneSource) {
+        guard lane(id: id)?.source != source else { return }
+        mutate(id) { $0.source = source }
         applyTopologyChange()
     }
 
@@ -418,6 +461,26 @@ public final class AudioEngine {
         }
     }
 
+    /// Checks — and, the first time, asks for — the system-audio-capture
+    /// permission by building and immediately destroying a real tap. There is
+    /// no query-only API for it (`ProcessTapPermission`), so this *is* the
+    /// request; call it from a user action, not from a view body.
+    @discardableResult
+    public func refreshSystemAudioAuthorization() -> SystemAudioAuthorization {
+        let result = ProcessTapPermission.probe()
+        systemAudioAuthorization = result
+        return result
+    }
+
+    /// True when some lane is fed by a process tap, which is the only reason
+    /// the system-audio permission matters at all.
+    public var usesProcessTaps: Bool { lanes.contains { $0.source.isProcessTap } }
+
+    /// Re-reads the HAL's process list into `tappableProcesses`.
+    public func refreshTappableProcesses() {
+        tappableProcesses = ProcessTapCatalog.outputProducingProcesses()
+    }
+
     // MARK: - Run / stop
 
     public func start() {
@@ -436,6 +499,15 @@ public final class AudioEngine {
                 fail("Microphone access is \(status == .denied ? "denied" : "restricted"). Enable Clapboard in System Settings › Privacy & Security › Microphone.")
             }
             return
+        }
+        // The system-audio permission is gated the same way, but only when
+        // something actually needs it: a microphone-only mix must not be held
+        // up by a permission it never uses. Unlike the microphone, refusal
+        // here is not fatal — the mix still runs and the tap lanes report why
+        // they are silent, which is strictly more useful than refusing to
+        // start at all when one of five lanes is a tap.
+        if usesProcessTaps, !systemAudioAuthorization.isAuthorized {
+            refreshSystemAudioAuthorization()
         }
         launch(context: nil)
     }
@@ -531,11 +603,59 @@ public final class AudioEngine {
     private func makeDependencyFingerprint() -> [String] {
         let uids = orderedInputDeviceUIDs() + graph.outputDeviceUIDs
         let known = knownDevices()
-        return uids.map { uid in
+        let parts = uids.map { uid -> String in
             guard let device = known.first(where: { $0.uid == uid }) else { return "\(uid)|gone" }
             return "\(uid)|\(device.inputStreamChannels)|\(device.outputStreamChannels)"
                 + "|\(device.isAlive)|\(Int(device.nominalSampleRate))"
         }
+        return parts
+    }
+
+    /// Watches the HAL's client-process list while an app tap is live, so a
+    /// tapped app quitting or launching rebuilds the aggregate the same way a
+    /// device being unplugged does. Registered only when it is needed: the
+    /// list changes constantly on a busy Mac.
+    private func startWatchingProcessList() {
+        stopWatchingProcessList()
+        guard orderedTapSpecs().contains(where: { $0.bundleID != nil }) else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.refreshTappableProcesses()
+                self.handleProcessListChange()
+            }
+        }
+        var address = AudioObjectPropertyAddress(kAudioHardwarePropertyProcessObjectList)
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID.system, &address, DispatchQueue.main, block)
+        if status == noErr { processListListener = block }
+    }
+
+    private func stopWatchingProcessList() {
+        guard let block = processListListener else { return }
+        var address = AudioObjectPropertyAddress(kAudioHardwarePropertyProcessObjectList)
+        AudioObjectRemovePropertyListenerBlock(AudioObjectID.system, &address, DispatchQueue.main, block)
+        processListListener = nil
+    }
+
+    /// Rebuilds only for the one change that a rebuild actually fixes: a tap
+    /// the aggregate does *not* carry (because the app was not playing when it
+    /// was built) whose app is now there.
+    ///
+    /// Deliberately not "the process ids changed". An app that respawns a
+    /// helper per sound would then rebuild the engine several times a second,
+    /// and it does not need to: a tap the aggregate already carries keeps
+    /// working across the tapped app quitting and coming back, because the
+    /// description carries `bundleIDs` with process restore enabled.
+    private func handleProcessListChange() {
+        guard runState.isRunning, let aggregate else { return }
+        let live = Set(aggregate.tapKeys)
+        let revivable = orderedTapSpecs().contains { spec in
+            guard let bundleID = spec.bundleID, !live.contains(spec.sourceKey) else { return false }
+            return !ProcessTapCatalog.objectIDs(bundleID: bundleID).isEmpty
+        }
+        guard revivable else { return }
+        scheduleRestart(after: 0.4, reason: "an app a lane taps started playing")
     }
 
     private func scheduleRestart(after delay: TimeInterval, reason: String) {
@@ -564,6 +684,7 @@ public final class AudioEngine {
         let device = try AggregateDevice.create(AggregateDeviceRequest(
             inputDeviceUIDs: inputUIDs,
             outputDeviceUIDs: outputDeviceUIDs,
+            tapSpecs: orderedTapSpecs(),
             sampleRate: 48_000,
             bufferFrameSize: 256,
             name: "Clapboard Mix"
@@ -589,7 +710,9 @@ public final class AudioEngine {
         // `align()` may have moved a sub-device to 48 kHz; re-read so the
         // fingerprint below records the shape the graph is actually built on.
         registry?.refresh()
+        refreshTappableProcesses()
         dependencyFingerprint = makeDependencyFingerprint()
+        startWatchingProcessList()
 
         let proc = HALIOProc(deviceID: device.objectID, state: host.state)
         proc.onEvent = { [weak self] event in
@@ -604,6 +727,7 @@ public final class AudioEngine {
         restartWork = nil
         watchdog?.invalidate()
         watchdog = nil
+        stopWatchingProcessList()
         ioProc?.stop()
         ioProc = nil
         // Safe now: `AudioDeviceStop` guarantees the block has returned, so
@@ -662,11 +786,18 @@ public final class AudioEngine {
         let presentInputs = Set(aggregate?.inputDeviceUIDs ?? [])
         let wantedOutputs = Set(graph.outputDeviceUIDs)
         let presentOutputs = Set(aggregate?.outputDeviceUIDs ?? [])
-        if wantedInputs.isSubset(of: presentInputs), wantedOutputs.isSubset(of: presentOutputs) {
+        // A tap lives inside the aggregate, so wanting one the aggregate does
+        // not carry needs the same rebuild adding a sub-device does. A tap the
+        // aggregate carries but nothing wants any more is left alone until the
+        // next rebuild — it costs one silent stream, not a click.
+        let wantedTaps = Set(orderedTapSpecs().map(\.sourceKey))
+        let presentTaps = Set(aggregate.map { $0.tapKeys + Array($0.tapFailures.keys) } ?? [])
+        if wantedInputs.isSubset(of: presentInputs), wantedOutputs.isSubset(of: presentOutputs),
+           wantedTaps.isSubset(of: presentTaps) {
             republishGraph()
             dependencyFingerprint = makeDependencyFingerprint()
         } else {
-            rebuild(reason: "routing needs a device the aggregate does not have")
+            rebuild(reason: "routing needs a source the aggregate does not have")
         }
     }
 
@@ -714,9 +845,26 @@ public final class AudioEngine {
     /// bring-up failure the next time the engine starts.
     func dropLanesConflictingWithOutputs() {
         let outputs = Set(buses.compactMap(\.outputDeviceUID))
-        for id in lanes.filter({ outputs.contains($0.deviceUID) }).map(\.id) {
+        for id in lanes.filter({ !$0.source.isProcessTap && outputs.contains($0.deviceUID) }).map(\.id) {
             removeLane(id: id)
         }
+    }
+
+    /// The taps the lanes want, in lane order, without duplicates. Two lanes
+    /// on the same app share one tap — the aggregate carries it once and both
+    /// lanes read the same channels out of it.
+    ///
+    /// Nothing is filtered on "is that app running": `ProcessTapFactory`
+    /// decides that, and a tap that cannot be built comes back as a reason on
+    /// the lane rather than as a silently dropped source.
+    public func orderedTapSpecs() -> [TapSpec] {
+        var seen = Set<String>()
+        var result: [TapSpec] = []
+        for spec in lanes.compactMap(\.source.tap) where !seen.contains(spec.sourceKey) {
+            seen.insert(spec.sourceKey)
+            result.append(spec)
+        }
+        return result
     }
 
     /// Lane source devices, in lane order, without duplicates.
@@ -733,6 +881,9 @@ public final class AudioEngine {
         let outputs = Set(graph.outputDeviceUIDs)
         var seen = Set<String>()
         var result: [String] = []
+        // A tap lane's `deviceUID` is `tap:…`, which is never a device UID, so
+        // `present` filters it out here without a special case. Its channels
+        // come from `orderedTapSpecs()` instead.
         for lane in lanes
         where !seen.contains(lane.deviceUID)
             && !outputs.contains(lane.deviceUID)
@@ -757,15 +908,25 @@ public final class AudioEngine {
         guard let aggregate else {
             host.unpublish()
             laneStatus = lanes.reduce(into: [:]) { $0[$1.id] = .idle }
+            laneStatusReason = [:]
             return
         }
         var nodes: [RTLaneNode] = []
         var status: [UUID: LaneStatus] = [:]
+        var reasons: [UUID: String] = [:]
         nodes.reserveCapacity(lanes.count)
         for lane in lanes {
             let runtime = host.runtime(for: lane.id)
             guard aggregate.inputLayout.globalChannels(forDeviceUID: lane.deviceUID) != nil else {
                 status[lane.id] = .deviceMissing
+                // A tap that would not build is the one case where "missing"
+                // needs a sentence: nothing is unplugged, macOS or the tapped
+                // app simply said no, and the lane must say which rather than
+                // sitting at the noise floor looking like a wiring mistake.
+                if let tap = lane.source.tap {
+                    reasons[lane.id] = aggregate.tapFailures[tap.sourceKey]
+                        ?? "The tap on \(tap.name) is not in the aggregate device."
+                }
                 nodes.append(RTLaneNode(
                     runtime: runtime, channelCount: max(1, lane.deviceChannels.count),
                     bufferIndex0: -1, channelInBuffer0: 0, channelsInBuffer0: 0
@@ -807,6 +968,7 @@ public final class AudioEngine {
             ))
         }
         laneStatus = status
+        laneStatusReason = reasons
 
         // Gain and effective enable (mute + solo scope) are parameter-only —
         // no snapshot needed — but this is the one place guaranteed to run

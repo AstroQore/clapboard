@@ -11,6 +11,14 @@ public struct AggregateDeviceRequest: Hashable, Sendable {
     /// destination some bus may write to. Never also an input. At least one
     /// is required.
     public var outputDeviceUIDs: [String]
+    /// Process taps to put inside the aggregate, in the order their channels
+    /// should appear after the sub-devices' (`kAudioAggregateDeviceTapListKey`).
+    ///
+    /// A tap that cannot be built — the app is not running, or macOS refuses
+    /// the capture — does not fail the whole aggregate: it lands in
+    /// `AggregateDevice.tapFailures` and the lanes that wanted it report the
+    /// reason instead of quietly capturing silence.
+    public var tapSpecs: [TapSpec]
     public var sampleRate: Double
     public var bufferFrameSize: UInt32
     public var name: String
@@ -18,12 +26,14 @@ public struct AggregateDeviceRequest: Hashable, Sendable {
     public init(
         inputDeviceUIDs: [String],
         outputDeviceUIDs: [String],
+        tapSpecs: [TapSpec] = [],
         sampleRate: Double = 48_000,
         bufferFrameSize: UInt32 = 256,
         name: String = "Clapboard Mix"
     ) {
         self.inputDeviceUIDs = inputDeviceUIDs
         self.outputDeviceUIDs = outputDeviceUIDs
+        self.tapSpecs = tapSpecs
         self.sampleRate = sampleRate
         self.bufferFrameSize = bufferFrameSize
         self.name = name
@@ -42,6 +52,7 @@ public enum AggregateDeviceError: Error, CustomStringConvertible, Sendable {
     case subDevicesInactive(missing: [String])
     case channelLayoutMismatch(scope: String, expected: [Int], actual: [Int])
     case outputStreamNotFound(uid: String)
+    case tapStreamsMissing(expected: [Int], actual: [Int])
 
     public var description: String {
         switch self {
@@ -69,6 +80,9 @@ public enum AggregateDeviceError: Error, CustomStringConvertible, Sendable {
             return "Aggregate \(scope) streams are \(actual) but its sub-devices add up to \(expected); refusing to guess the channel map."
         case .outputStreamNotFound(let uid):
             return "The aggregate exposes no output stream belonging to \(uid)."
+        case .tapStreamsMissing(let expected, let actual):
+            return "The aggregate's input streams are \(actual) but its sub-devices plus taps should give \(expected); "
+                + "refusing to guess which stream belongs to which tap."
         }
     }
 }
@@ -88,10 +102,19 @@ public final class AggregateDevice {
     /// Every output device the aggregate carries, in priority order. The
     /// first is the clock main (`kAudioAggregateDeviceMainSubDeviceKey`).
     public let outputDeviceUIDs: [String]
+    /// The process taps living inside this aggregate. Owned: `destroy()` tears
+    /// them down with the device, and so does `deinit`.
+    public let taps: [ProcessTap]
+    /// Taps the request asked for that could not be built, keyed by
+    /// `TapSpec.sourceKey`, with the reason to show on the lane.
+    public let tapFailures: [String: String]
     public let sampleRate: Double
     public let bufferFrameSize: UInt32
 
-    /// Where each sub-device's input channels land in the IOProc input list.
+    /// Where each sub-device's — and each tap's — input channels land in the
+    /// IOProc input list. A tap's channels are filed under `TapSpec.sourceKey`,
+    /// exactly the way a sub-device's are filed under its device UID, so
+    /// nothing downstream has to know which kind of source a lane has.
     public let inputLayout: AggregateInputLayout
     /// Same arithmetic for the output list. An *input* sub-device that also
     /// exposes output streams (Loopback always does) contributes buffers here
@@ -109,6 +132,8 @@ public final class AggregateDevice {
         name: String,
         inputDeviceUIDs: [String],
         outputDeviceUIDs: [String],
+        taps: [ProcessTap],
+        tapFailures: [String: String],
         sampleRate: Double,
         bufferFrameSize: UInt32,
         inputLayout: AggregateInputLayout,
@@ -120,6 +145,8 @@ public final class AggregateDevice {
         self.name = name
         self.inputDeviceUIDs = inputDeviceUIDs
         self.outputDeviceUIDs = outputDeviceUIDs
+        self.taps = taps
+        self.tapFailures = tapFailures
         self.sampleRate = sampleRate
         self.bufferFrameSize = bufferFrameSize
         self.inputLayout = inputLayout
@@ -146,12 +173,18 @@ public final class AggregateDevice {
         outputDeviceUIDs.first.flatMap(outputSlot(forDeviceUID:))
     }
 
+    /// The lane source keys of every tap this aggregate actually carries.
+    public var tapKeys: [String] { taps.map(\.spec.sourceKey) }
+
     deinit { destroy() }
 
+    /// Order matters: the taps go after the aggregate that referenced them, so
+    /// the HAL is never asked to destroy a tap an aggregate still names.
     public func destroy() {
         guard !destroyed else { return }
         destroyed = true
         AudioHardwareDestroyAggregateDevice(objectID)
+        for tap in taps { tap.destroy() }
     }
 
     public var isDestroyed: Bool { destroyed }
@@ -163,9 +196,16 @@ public final class AggregateDevice {
             guard let slot = outputSlot(forDeviceUID: uid) else { return "\(uid)[?]" }
             return "\(uid)[buf=\(slot.bufferIndex)/\(slot.channelCount)ch]"
         }.joined(separator: " ")
-        return "\(name) id=\(objectID) rate=\(Int(sampleRate)) buffer=\(bufferFrameSize) "
+        var text = "\(name) id=\(objectID) rate=\(Int(sampleRate)) buffer=\(bufferFrameSize) "
             + "in=\(inputLayout.totalChannels)ch(\(inputLayout.bufferCount) streams) "
             + "clockKey=\(usedClockDeviceKey) | in: \(inputs) | out: \(outputs)"
+        if !taps.isEmpty {
+            text += " | taps: " + taps.map(\.summary).joined(separator: " ")
+        }
+        if !tapFailures.isEmpty {
+            text += " | tap failures: " + tapFailures.keys.sorted().joined(separator: " ")
+        }
+        return text
     }
 
     // MARK: - Creation
@@ -221,6 +261,26 @@ public final class AggregateDevice {
         }
         devices = try AudioDeviceInfo.enumerateAll()
 
+        // --- Build the taps before the description, because the description
+        // refers to them by UID. A tap that will not build is recorded and
+        // skipped: one app that stopped playing must not take the whole mix
+        // down, and the lane that wanted it reports the reason.
+        var taps: [ProcessTap] = []
+        var tapFailures: [String: String] = [:]
+        var seenTaps = Set<String>()
+        for spec in request.tapSpecs where !seenTaps.contains(spec.sourceKey) {
+            seenTaps.insert(spec.sourceKey)
+            do {
+                taps.append(try ProcessTapFactory.make(spec))
+            } catch let error as ProcessTapError {
+                tapFailures[spec.sourceKey] = error.laneReason
+            } catch {
+                tapFailures[spec.sourceKey] = String(describing: error)
+            }
+        }
+        var tapsAdopted = false
+        defer { if !tapsAdopted { for tap in taps { tap.destroy() } } }
+
         // --- Build the description. Inputs get drift compensation; so does
         // every output device except the first, which is the clock main and
         // must not be resampled against itself.
@@ -244,6 +304,14 @@ public final class AggregateDevice {
             kAudioAggregateDeviceSubDeviceListKey: subDeviceList,
             kAudioAggregateDeviceMainSubDeviceKey: clockMainUID
         ]
+        if !taps.isEmpty {
+            // A tap follows whatever device the tapped app plays to, which is
+            // not necessarily this aggregate's clock main, so it gets drift
+            // compensation for the same reason every input sub-device does.
+            description[kAudioAggregateDeviceTapListKey] = taps.map {
+                [kAudioSubTapUIDKey: $0.uid, kAudioSubTapDriftCompensationKey: 1] as [String: Any]
+            }
+        }
 
         // `kAudioAggregateDeviceClockDeviceKey` wants the UID of an
         // AudioClockDevice, not of an audio device. Ask for it anyway — some
@@ -294,24 +362,39 @@ public final class AggregateDevice {
             return device
         }
 
-        let inputSubLayouts = try orderedUIDs.map {
+        let deviceInputLayouts = try orderedUIDs.map {
             SubDeviceInputLayout(deviceUID: $0, streamChannelCounts: try info($0).inputStreamChannels)
+        }
+        // A tap contributes one input stream, filed under the lane source key
+        // rather than a device UID. Observed on this Mac and re-checked below:
+        // the HAL appends tap streams *after* every sub-device stream, so an
+        // aggregate of a 1-channel microphone, a 2-channel Loopback and a
+        // stereo tap advertises `[1, 2, 2]`.
+        let tapInputLayouts = taps.map {
+            SubDeviceInputLayout(deviceUID: $0.spec.sourceKey, streamChannelCounts: [$0.channelCount])
         }
         let outputSubLayouts = try orderedUIDs.map {
             SubDeviceStreamLayout(deviceUID: $0, streamChannelCounts: try info($0).outputStreamChannels)
         }
-        let inputLayout = AggregateInputLayout(subDevices: inputSubLayouts)
+        let inputLayout = AggregateInputLayout(subDevices: deviceInputLayouts + tapInputLayouts)
         let outputLayout = AggregateStreamLayout(subDevices: outputSubLayouts)
 
         // --- Cross-check against what the aggregate itself advertises. If
         // these disagree the channel offsets we would hand the render thread
         // are fiction, and a sub-device that silently dropped out is exactly
-        // the case that shifts them.
+        // the case that shifts them. That is doubly true with taps in the mix:
+        // "taps come last" is checked here against the real stream
+        // configuration on every single bring-up, never assumed.
         let aggregateInput = try objectID.streamChannelCounts(scope: kAudioObjectPropertyScopeInput)
         let aggregateOutput = try objectID.streamChannelCounts(scope: kAudioObjectPropertyScopeOutput)
         guard aggregateInput == inputLayout.slots.map(\.channelCount) else {
-            throw AggregateDeviceError.channelLayoutMismatch(
-                scope: "input", expected: inputLayout.slots.map(\.channelCount), actual: aggregateInput
+            if taps.isEmpty {
+                throw AggregateDeviceError.channelLayoutMismatch(
+                    scope: "input", expected: inputLayout.slots.map(\.channelCount), actual: aggregateInput
+                )
+            }
+            throw AggregateDeviceError.tapStreamsMissing(
+                expected: inputLayout.slots.map(\.channelCount), actual: aggregateInput
             )
         }
         guard aggregateOutput == outputLayout.slots.map(\.channelCount) else {
@@ -332,12 +415,15 @@ public final class AggregateDevice {
         }
 
         created = true
+        tapsAdopted = true
         return AggregateDevice(
             objectID: objectID,
             uid: aggregateUID,
             name: request.name,
             inputDeviceUIDs: inputUIDs,
             outputDeviceUIDs: outputUIDs,
+            taps: taps,
+            tapFailures: tapFailures,
             sampleRate: actualRate,
             bufferFrameSize: actualBuffer,
             inputLayout: inputLayout,
