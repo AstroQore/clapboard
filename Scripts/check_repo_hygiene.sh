@@ -51,9 +51,17 @@ done
 # --- 2. Personal email addresses -------------------------------------------
 # Allowed: noreply@anthropic.com (agent co-author trailer) and any
 # *@users.noreply.github.com address (GitHub's own privacy-preserving email).
+#
+# Resources/ThirdPartyLicenses/ is exempt: those files are upstream license
+# texts copied verbatim (Sparkle's, for one, carries the orlp/ed25519 author's
+# copyright line). Editing an author out of a copyright notice to satisfy a
+# lint rule is the one fix that is worse than the hit.
 EMAIL_RE='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 for f in "${FILES[@]}"; do
     [[ -f "$f" ]] || continue
+    case "$f" in
+        Resources/ThirdPartyLicenses/*) continue ;;
+    esac
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         lineno="${line%%:*}"

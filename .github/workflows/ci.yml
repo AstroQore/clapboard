@@ -45,6 +45,16 @@ jobs:
       - name: Verify empty entitlements
         run: codesign -d --entitlements - .build/Clapboard.app
 
+      # A missing framework or an out-of-order codesign only shows up when a
+      # user launches the app, which is far too late to find out.
+      - name: Verify the embedded Sparkle framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x .build/Clapboard.app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle
+          test -f .build/Clapboard.app/Contents/Resources/ThirdPartyLicenses/Sparkle.txt
+          codesign --verify --deep --strict .build/Clapboard.app
+
       - name: Repo hygiene check
         run: ./Scripts/check_repo_hygiene.sh
 
