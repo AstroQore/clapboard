@@ -10,7 +10,7 @@ import Foundation
 /// meters, rebuild recovery, hot lane add/remove, and clean teardown.
 ///
 ///     Clapboard --engine-test 120 \
-///         --output "监听" --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" \
+///         --output "Loopback" --lane "MacBook Pro Microphone" --lane "BlackHole 2ch" \
 ///         --rebuild-at 20 --hot-lane "Loopback"
 ///
 /// `--save-session` writes the resulting lanes and output device to the session
@@ -564,6 +564,14 @@ enum EngineSmokeTest {
         exit(1)
     }
 
+    /// The value that follows a flag, or nil when the flag is absent or last.
+    static func value(of flag: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else {
+            return nil
+        }
+        return arguments[index + 1]
+    }
+
     static func short(_ name: String) -> String {
         String(name.prefix(14)).replacingOccurrences(of: " ", with: "_")
     }
@@ -583,9 +591,11 @@ enum EngineSmokeTest {
 /// without needing the caller to know this Mac's device names.
 ///
 /// Builds Master (unchanged) with two children, `BusA` and `BusB`, each with
-/// its own output device — a "Loopback" device and, in order of preference, a
-/// "监听"/"監聽" device or a second "Loopback" device — and routes up to two
-/// input devices onto `BusA`. Then checks, in order: the private aggregate
+/// its own output device, and routes up to two input devices onto `BusA`.
+/// The two outputs are chosen from whatever this Mac has: virtual devices
+/// first, because sending a test signal to a loopback disturbs nobody, and
+/// `--output-a` / `--output-b` override the choice by name. Then checks, in
+/// order: the private aggregate
 /// really carries both output devices, IOProc callbacks are flowing, every
 /// bus's meter reads a sane value, mute/solo flags apply, every lane on
 /// `BusA` reaches its output at the same total latency (`docs/ROUTING.md`'s
@@ -604,21 +614,49 @@ extension EngineSmokeTest {
         registry.start()
         let devices = registry.devices
 
-        func findOutput(containing needles: [String], excluding: Set<String> = []) -> AudioDeviceInfo? {
+        func named(_ query: String, excluding: Set<String> = []) -> AudioDeviceInfo? {
             devices.first { device in
                 device.hasOutput && !excluding.contains(device.uid)
-                    && needles.contains { needle in device.name.localizedCaseInsensitiveContains(needle) }
+                    && (device.uid == query || device.name == query
+                        || device.name.localizedCaseInsensitiveContains(query))
             }
         }
 
-        guard let deviceA = findOutput(containing: ["Loopback"]) else {
-            fail("--routing-selftest needs at least one \"Loopback\" output device on this Mac")
+        /// Any output this Mac has, virtual ones first: writing a test signal
+        /// into a loopback device is silent to whoever is sitting there, while
+        /// picking their speakers is not. Aggregates are skipped because the
+        /// engine builds its own.
+        func candidates(excluding: Set<String> = []) -> [AudioDeviceInfo] {
+            devices
+                .filter {
+                    $0.hasOutput && !$0.isHidden && !$0.transport.isAggregate
+                        && !excluding.contains($0.uid)
+                }
+                .sorted { left, right in
+                    if left.transport.isVirtual != right.transport.isVirtual {
+                        return left.transport.isVirtual
+                    }
+                    return false
+                }
         }
-        guard let deviceB = findOutput(containing: ["监听", "監聽"], excluding: [deviceA.uid])
-            ?? findOutput(containing: ["Loopback"], excluding: [deviceA.uid])
+
+        let requestedA = Self.value(of: "--output-a", in: arguments)
+        let requestedB = Self.value(of: "--output-b", in: arguments)
+        guard let deviceA = requestedA.flatMap({ named($0) }) ?? candidates().first else {
+            if let requestedA {
+                fail("--output-a: no output device matches \"\(requestedA)\" on this Mac")
+            }
+            fail("--routing-selftest needs at least one output device on this Mac")
+        }
+        let excludingA: Set<String> = [deviceA.uid]
+        guard let deviceB = requestedB.flatMap({ named($0, excluding: excludingA) })
+            ?? candidates(excluding: excludingA).first
         else {
-            fail("--routing-selftest needs a second output device — a \"监听\"/\"監聽\" device, "
-                + "or a second \"Loopback\" device — on this Mac")
+            if let requestedB {
+                fail("--output-b: no second output device matches \"\(requestedB)\" on this Mac")
+            }
+            fail("--routing-selftest needs two output devices; this Mac has one. "
+                + "A virtual device such as Loopback or BlackHole gives you a second.")
         }
         say("devices  A=\(deviceA.name) [\(deviceA.uid)]  B=\(deviceB.name) [\(deviceB.uid)]")
 
