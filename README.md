@@ -16,8 +16,8 @@ clap on every lane and writes the compensating delay into each one.
 | Milestone | State |
 |---|---|
 | M0 Scaffold, device list, hot-plug | done |
-| M1 Multi-device capture + mix + output (private aggregate device, HAL IOProc) | next |
-| M2 Per-lane gain / switch / delay / polarity, meters | planned |
+| M1 Multi-device capture + mix + output (private aggregate device, HAL IOProc) | done |
+| M2 Per-lane gain / switch / delay / polarity, meters | done |
 | M3 Auto Sync (onset detection + band-limited GCC-PHAT) | planned |
 | M4 Audio Unit hosting with latency compensation | planned |
 | M5 Session persistence, missing-device handling | planned |
@@ -33,8 +33,22 @@ swift test
 open .build/Clapboard.app
 ```
 
-`.build/Clapboard.app --list-devices` prints every Core Audio device the
-app sees and exits; handy for scripts.
+`.build/Clapboard.app/Contents/MacOS/Clapboard --list-devices` prints every
+Core Audio device the app sees and exits; handy for scripts.
+
+`--engine-test <seconds>` runs the engine headlessly and prints one line per
+second — callback count, overload count, watchdog age and every meter — so the
+whole capture path can be checked from a script:
+
+```sh
+.build/Clapboard.app/Contents/MacOS/Clapboard --engine-test 120 \
+    --output "Loopback" --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" \
+    --rebuild-at 20 --hot-lane "Mic Mix"
+```
+
+It exits non-zero if an aggregate device survives the teardown. Add
+`--ignore-tcc` to exercise everything except real capture on a machine where
+the microphone prompt has not been answered.
 
 Always run the `.app`, never `swift run`: microphone access is granted to a
 bundle identifier, and a bare executable has none.

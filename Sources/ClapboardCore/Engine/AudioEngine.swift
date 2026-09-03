@@ -1,0 +1,563 @@
+import AVFoundation
+import CoreAudio
+import Foundation
+import Observation
+
+/// The one place the app drives audio from.
+///
+/// Owns the private aggregate device, the IOProc, and the real-time graph.
+/// Everything here is main-actor bound; the render thread only ever sees the
+/// `RTState` pointer handed to `HALIOProc`.
+@MainActor
+@Observable
+public final class AudioEngine {
+    public enum RunState: Equatable, Sendable {
+        case stopped
+        case starting
+        case running
+        case failed(String)
+
+        public var isRunning: Bool { self == .running }
+        public var isBusy: Bool { self == .starting }
+
+        public var label: String {
+            switch self {
+            case .stopped: return "Stopped"
+            case .starting: return "Starting…"
+            case .running: return "Running"
+            case .failed(let message): return "Error: \(message)"
+            }
+        }
+    }
+
+    /// Why a lane is not contributing to the mix.
+    public enum LaneStatus: Equatable, Sendable {
+        case ok
+        case deviceMissing
+        case channelOutOfRange
+        case idle
+
+        public var isProblem: Bool { self == .deviceMissing || self == .channelOutOfRange }
+    }
+
+    // MARK: - Observable state
+
+    public private(set) var lanes: [LaneConfig] = []
+    public private(set) var outputDeviceUID: String?
+    public private(set) var runState: RunState = .stopped
+    public private(set) var lastError: String?
+    /// Sub-device drift compensation inserts a resampler whose latency is not
+    /// reported and changes when the aggregate is rebuilt, so measured delays
+    /// have to be re-taken after one.
+    public private(set) var delaysMayBeStale = false
+    public private(set) var overloadCount = 0
+    public private(set) var callbackHealthy = false
+    public private(set) var secondsSinceLastCallback: Double = 0
+    public private(set) var restartCount = 0
+    public private(set) var aggregateSummary: String?
+    public private(set) var laneStatus: [UUID: LaneStatus] = [:]
+    public var masterGainDB: Float = 0 {
+        didSet { host.setMasterGain(linear: Decibels.linear(masterGainDB)) }
+    }
+    public private(set) var microphoneAuthorized = false
+
+    /// Diagnostics only. Lets the engine run without microphone TCC so the
+    /// aggregate device, IOProc cadence and output path can be exercised on a
+    /// machine where the prompt has not been answered — capture is silent in
+    /// that case, because the HAL substitutes zeros rather than failing. The
+    /// UI never sets this.
+    public var allowsUnauthorizedCapture = false
+
+    public var sampleRate: Double { aggregate?.sampleRate ?? 48_000 }
+    public var bufferFrameSize: Int { Int(aggregate?.bufferFrameSize ?? 256) }
+
+    // MARK: - Private
+
+    private let host = RTEngineHost()
+    private var aggregate: AggregateDevice?
+    private var ioProc: HALIOProc?
+    private var watchdog: Timer?
+    private var restartWork: DispatchWorkItem?
+    private weak var registry: AudioDeviceRegistry?
+    private var suspendedForSleep = false
+    /// Shape of the devices the running graph depends on, captured at bring-up.
+    private var dependencyFingerprint: [String] = []
+    /// Watchdog only fires once the engine has actually seen a callback, so a
+    /// slow-starting device is not mistaken for a dead one.
+    private var sawFirstCallback = false
+
+    public init() {
+        host.setMeterDecay(framesPerBlock: 256, sampleRate: 48_000)
+        refreshAuthorization()
+    }
+
+    deinit {
+        // `deinit` cannot hop to the main actor; the app calls `shutdown()`
+        // from `applicationWillTerminate`, and a private aggregate dies with
+        // the process anyway.
+    }
+
+    // MARK: - Wiring
+
+    /// Subscribes to hot-plug notifications, chaining any handler already set.
+    public func attach(registry: AudioDeviceRegistry) {
+        self.registry = registry
+        let previous = registry.onHardwareChange
+        registry.onHardwareChange = { [weak self] in
+            previous?()
+            self?.handleHardwareChange()
+        }
+    }
+
+    // MARK: - Lanes
+
+    @discardableResult
+    public func addLane(deviceUID: String, deviceChannels: [Int], name: String) -> LaneConfig {
+        let lane = LaneConfig(deviceUID: deviceUID, deviceChannels: deviceChannels, name: name)
+        lanes.append(lane)
+        host.runtime(for: lane.id)
+        pushParameters(lane)
+        applyTopologyChange()
+        return lane
+    }
+
+    public func removeLane(id: UUID) {
+        guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
+        lanes.remove(at: index)
+        laneStatus[id] = nil
+        // The runtime is only detached here; `RTEngineHost` frees it once the
+        // render thread has moved past the snapshot that referenced it.
+        host.discardRuntime(for: id)
+        applyTopologyChange()
+    }
+
+    /// Lane order is cosmetic — the mix is a plain sum — but it is also the
+    /// order the aggregate's sub-devices are listed in, so a reorder republishes.
+    public func moveLanes(fromOffsets source: IndexSet, toOffset destination: Int) {
+        let moving = source.sorted().compactMap { $0 < lanes.count ? lanes[$0] : nil }
+        var remaining = lanes
+        for index in source.sorted(by: >) where index < remaining.count {
+            remaining.remove(at: index)
+        }
+        let insertion = min(max(0, destination - source.filter { $0 < destination }.count), remaining.count)
+        remaining.insert(contentsOf: moving, at: insertion)
+        lanes = remaining
+        republishGraph()
+    }
+
+    public func lane(id: UUID) -> LaneConfig? {
+        lanes.first { $0.id == id }
+    }
+
+    // Parameter edits never rebuild anything: they land in atomics the render
+    // thread reads on its next block.
+
+    public func setLaneGainDB(_ id: UUID, _ db: Float) {
+        mutate(id) { $0.gainDB = db }
+        host.setLaneGain(id, linear: Decibels.linear(db))
+    }
+
+    public func setLaneEnabled(_ id: UUID, _ enabled: Bool) {
+        mutate(id) { $0.enabled = enabled }
+        host.setLaneEnabled(id, enabled)
+    }
+
+    public func setLanePolarity(_ id: UUID, inverted: Bool) {
+        mutate(id) { $0.polarityInverted = inverted }
+        host.setLanePolarity(id, inverted: inverted)
+    }
+
+    public func setLaneDelaySamples(_ id: UUID, _ samples: Int) {
+        let clamped = max(0, min(RTLimits.maxDelaySamples, samples))
+        mutate(id) { $0.delaySamples = clamped }
+        host.setLaneDelay(id, samples: clamped)
+    }
+
+    public func setLaneName(_ id: UUID, _ name: String) {
+        mutate(id) { $0.name = name }
+    }
+
+    public func setLaneSource(_ id: UUID, deviceUID: String, deviceChannels: [Int]) {
+        mutate(id) {
+            $0.deviceUID = deviceUID
+            $0.deviceChannels = Array(deviceChannels.prefix(2))
+        }
+        applyTopologyChange()
+    }
+
+    public func setOutputDevice(uid: String?) {
+        guard outputDeviceUID != uid else { return }
+        outputDeviceUID = uid
+        // Lane sources may no longer be legal (the output device can never be
+        // a lane source), and the aggregate's clock main changed.
+        lanes.removeAll { $0.deviceUID == uid }
+        if runState.isRunning || runState.isBusy {
+            rebuild(reason: "output device changed")
+        }
+    }
+
+    public func acknowledgeStaleDelays() {
+        delaysMayBeStale = false
+    }
+
+    private func mutate(_ id: UUID, _ body: (inout LaneConfig) -> Void) {
+        guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
+        body(&lanes[index])
+    }
+
+    private func pushParameters(_ lane: LaneConfig) {
+        host.setLaneGain(lane.id, linear: Decibels.linear(lane.gainDB))
+        host.setLaneEnabled(lane.id, lane.enabled)
+        host.setLanePolarity(lane.id, inverted: lane.polarityInverted)
+        host.setLaneDelay(lane.id, samples: lane.delaySamples)
+    }
+
+    // MARK: - Meters
+
+    public func meter(laneID: UUID) -> MeterReading { host.laneMeter(laneID) }
+    public var masterMeter: MeterReading { host.masterMeter }
+    public var masterPeaks: (left: Float, right: Float) { host.masterPeaks }
+    public var callbackCount: Int { host.callbackCount }
+    public var droppedBlocks: Int { host.droppedBlocks }
+
+    // MARK: - Permission
+
+    public func refreshAuthorization() {
+        microphoneAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+
+    public func requestAuthorization(_ completion: (@Sendable @MainActor (Bool) -> Void)? = nil) {
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            Task { @MainActor [weak self] in
+                self?.refreshAuthorization()
+                completion?(granted)
+            }
+        }
+    }
+
+    // MARK: - Run / stop
+
+    public func start() {
+        guard runState != .running, runState != .starting else { return }
+        refreshAuthorization()
+        // Without TCC the HAL hands the IOProc zeros rather than an error, so
+        // a silent mix would look like a wiring bug. Gate on it instead.
+        guard microphoneAuthorized || allowsUnauthorizedCapture else {
+            let status = AVCaptureDevice.authorizationStatus(for: .audio)
+            if status == .notDetermined {
+                requestAuthorization { [weak self] granted in
+                    if granted { self?.start() }
+                }
+                fail("Waiting for microphone permission…")
+            } else {
+                fail("Microphone access is \(status == .denied ? "denied" : "restricted"). Enable Clapboard in System Settings › Privacy & Security › Microphone.")
+            }
+            return
+        }
+        launch(context: nil)
+    }
+
+    public func stop() {
+        tearDown()
+        runState = .stopped
+        lastError = nil
+    }
+
+    /// Full teardown and bring-up. Used by the watchdog, by hot-plug handling
+    /// and by the UI's Rebuild button. A no-op when the engine is stopped.
+    public func rebuild(reason: String) {
+        guard runState.isRunning || runState.isBusy else { return }
+        tearDown()
+        restartCount += 1
+        // Drift compensation's resampler latency is not reported and can land
+        // differently every time the aggregate is built, so any delay measured
+        // before this rebuild is now suspect.
+        delaysMayBeStale = true
+        launch(context: reason)
+    }
+
+    private func launch(context: String?) {
+        lastError = nil
+        runState = .starting
+        guard let outputDeviceUID else {
+            fail("Pick an output device first.")
+            return
+        }
+        do {
+            try bringUp(outputDeviceUID: outputDeviceUID)
+            sawFirstCallback = false
+            runState = .running
+            startWatchdog()
+        } catch {
+            tearDown()
+            fail(context.map { "\($0): \(error)" } ?? String(describing: error))
+        }
+    }
+
+    /// Called from `applicationWillTerminate`.
+    public func shutdown() {
+        tearDown()
+        runState = .stopped
+    }
+
+    // MARK: - System events
+
+    public func handleWillSleep() {
+        guard runState.isRunning || runState.isBusy else { return }
+        suspendedForSleep = true
+        tearDown()
+        runState = .stopped
+    }
+
+    public func handleDidWake() {
+        guard suspendedForSleep else { return }
+        suspendedForSleep = false
+        delaysMayBeStale = true
+        // Devices reappear a little after the wake notification, so give the
+        // HAL time to re-enumerate before starting again.
+        schedule(after: 1.5) { engine in
+            engine.registry?.refresh()
+            engine.start()
+        }
+    }
+
+    public func handleHardwareChange() {
+        guard runState.isRunning || runState.isBusy else { return }
+        // Creating and destroying our own aggregate device changes
+        // `kAudioHardwarePropertyDevices`, so reacting to every notification
+        // makes the engine rebuild itself forever. Only a change to a device
+        // the graph actually depends on matters — that is also the dangerous
+        // case, since a vanished sub-device silently shifts every channel
+        // offset after it.
+        let current = makeDependencyFingerprint()
+        guard current != dependencyFingerprint else { return }
+        dependencyFingerprint = current
+        // Hot-plug arrives as a burst of notifications; coalesce them.
+        scheduleRestart(after: 0.4, reason: "a device the mix uses changed")
+    }
+
+    private func makeDependencyFingerprint() -> [String] {
+        let uids = orderedInputDeviceUIDs() + (outputDeviceUID.map { [$0] } ?? [])
+        let known = registry?.devices ?? ((try? AudioDeviceInfo.enumerateAll()) ?? [])
+        return uids.map { uid in
+            guard let device = known.first(where: { $0.uid == uid }) else { return "\(uid)|gone" }
+            return "\(uid)|\(device.inputStreamChannels)|\(device.outputStreamChannels)"
+                + "|\(device.isAlive)|\(Int(device.nominalSampleRate))"
+        }
+    }
+
+    private func scheduleRestart(after delay: TimeInterval, reason: String) {
+        schedule(after: delay) { engine in
+            engine.registry?.refresh()
+            engine.rebuild(reason: reason)
+        }
+    }
+
+    private func schedule(after delay: TimeInterval, _ body: @escaping (AudioEngine) -> Void) {
+        restartWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                body(self)
+            }
+        }
+        restartWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: - Bring-up
+
+    private func bringUp(outputDeviceUID: String) throws {
+        let inputUIDs = orderedInputDeviceUIDs()
+        let device = try AggregateDevice.create(AggregateDeviceRequest(
+            inputDeviceUIDs: inputUIDs,
+            outputDeviceUID: outputDeviceUID,
+            sampleRate: 48_000,
+            bufferFrameSize: 256,
+            name: "Clapboard Mix"
+        ))
+        aggregate = device
+        aggregateSummary = device.summary
+        host.setMeterDecay(framesPerBlock: Int(device.bufferFrameSize), sampleRate: device.sampleRate)
+        host.resetCounters()
+        overloadCount = 0
+        for lane in lanes {
+            host.runtime(for: lane.id)
+            pushParameters(lane)
+        }
+        host.setMasterGain(linear: Decibels.linear(masterGainDB))
+        republishGraph()
+
+        // `align()` may have moved a sub-device to 48 kHz; re-read so the
+        // fingerprint below records the shape the graph is actually built on.
+        registry?.refresh()
+        dependencyFingerprint = makeDependencyFingerprint()
+
+        let proc = HALIOProc(deviceID: device.objectID, state: host.state)
+        proc.onEvent = { [weak self] event in
+            MainActor.assumeIsolated { self?.handle(event: event) }
+        }
+        try proc.start()
+        ioProc = proc
+    }
+
+    private func tearDown() {
+        restartWork?.cancel()
+        restartWork = nil
+        watchdog?.invalidate()
+        watchdog = nil
+        ioProc?.stop()
+        ioProc = nil
+        // Safe now: `AudioDeviceStop` guarantees the block has returned, so
+        // every retired snapshot can be reclaimed.
+        host.unpublish()
+        aggregate?.destroy()
+        aggregate = nil
+        aggregateSummary = nil
+        callbackHealthy = false
+        sawFirstCallback = false
+        dependencyFingerprint = []
+    }
+
+    private func fail(_ message: String) {
+        lastError = message
+        runState = .failed(message)
+    }
+
+    private func handle(event: HALIOProc.Event) {
+        switch event {
+        case .overload:
+            overloadCount = host.overloadCount
+        case .deviceDied:
+            guard runState.isRunning else { return }
+            scheduleRestart(after: 0.2, reason: "aggregate device died")
+        case .sampleRateChanged, .bufferSizeChanged:
+            guard runState.isRunning, let aggregate else { return }
+            let rate = (try? aggregate.objectID.property(.init(kAudioDevicePropertyNominalSampleRate), as: Double.self)) ?? 0
+            let frames = (try? aggregate.objectID.property(.init(kAudioDevicePropertyBufferFrameSize), as: UInt32.self)) ?? 0
+            if abs(rate - 48_000) > 0.5 || frames == 0 {
+                scheduleRestart(after: 0.2, reason: "aggregate format changed")
+            } else {
+                host.setMeterDecay(framesPerBlock: Int(frames), sampleRate: rate)
+            }
+        }
+    }
+
+    // MARK: - Graph
+
+    /// A topology edit only needs a full restart when the aggregate does not
+    /// already carry every device the lanes want. Adding or removing a lane on
+    /// a device that is already a sub-device is a snapshot swap, which is
+    /// click-free.
+    private func applyTopologyChange() {
+        guard runState.isRunning || runState.isBusy else {
+            republishGraph()
+            return
+        }
+        let wanted = Set(orderedInputDeviceUIDs())
+        let present = Set(aggregate?.inputDeviceUIDs ?? [])
+        if wanted.isSubset(of: present) {
+            republishGraph()
+            dependencyFingerprint = makeDependencyFingerprint()
+        } else {
+            rebuild(reason: "lane needs a device the aggregate does not have")
+        }
+    }
+
+    private func orderedInputDeviceUIDs() -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for lane in lanes where !seen.contains(lane.deviceUID) && lane.deviceUID != outputDeviceUID {
+            seen.insert(lane.deviceUID)
+            result.append(lane.deviceUID)
+        }
+        return result
+    }
+
+    private func republishGraph() {
+        guard let aggregate else {
+            host.unpublish()
+            laneStatus = lanes.reduce(into: [:]) { $0[$1.id] = .idle }
+            return
+        }
+        var nodes: [RTLaneNode] = []
+        var status: [UUID: LaneStatus] = [:]
+        nodes.reserveCapacity(lanes.count)
+        for lane in lanes {
+            let runtime = host.runtime(for: lane.id)
+            guard aggregate.inputLayout.globalChannels(forDeviceUID: lane.deviceUID) != nil else {
+                status[lane.id] = .deviceMissing
+                nodes.append(RTLaneNode(
+                    runtime: runtime, channelCount: max(1, lane.deviceChannels.count),
+                    bufferIndex0: -1, channelInBuffer0: 0, channelsInBuffer0: 0
+                ))
+                continue
+            }
+            var located: [(buffer: Int, channel: Int, stride: Int)] = []
+            var resolved = true
+            for deviceChannel in lane.deviceChannels {
+                guard
+                    let global = aggregate.inputLayout.globalChannel(deviceUID: lane.deviceUID, deviceChannel: deviceChannel),
+                    let position = aggregate.inputLayout.locate(globalChannel: global)
+                else {
+                    resolved = false
+                    break
+                }
+                let stride = aggregate.inputLayout.slots[position.bufferIndex].channelCount
+                located.append((position.bufferIndex, position.channel, stride))
+            }
+            guard resolved, let first = located.first else {
+                status[lane.id] = .channelOutOfRange
+                nodes.append(RTLaneNode(
+                    runtime: runtime, channelCount: max(1, lane.deviceChannels.count),
+                    bufferIndex0: -1, channelInBuffer0: 0, channelsInBuffer0: 0
+                ))
+                continue
+            }
+            status[lane.id] = .ok
+            let second = located.count > 1 ? located[1] : nil
+            nodes.append(RTLaneNode(
+                runtime: runtime,
+                channelCount: located.count,
+                bufferIndex0: first.buffer,
+                channelInBuffer0: first.channel,
+                channelsInBuffer0: first.stride,
+                bufferIndex1: second?.buffer ?? -1,
+                channelInBuffer1: second?.channel ?? 0,
+                channelsInBuffer1: second?.stride ?? 0
+            ))
+        }
+        laneStatus = status
+        host.publish(
+            nodes: nodes,
+            outputBufferIndex: aggregate.masterOutputBufferIndex,
+            outputChannelsInBuffer: aggregate.masterOutputChannels,
+            outputChannelOffset: 0
+        )
+    }
+
+    // MARK: - Watchdog
+
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickWatchdog() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdog = timer
+    }
+
+    private func tickWatchdog() {
+        host.collectGarbage()
+        overloadCount = host.overloadCount
+        guard runState.isRunning else { return }
+        let hostTime = host.lastCallbackHostTime
+        if hostTime != 0 { sawFirstCallback = true }
+        let age = HostClock.seconds(since: hostTime)
+        secondsSinceLastCallback = age
+        callbackHealthy = sawFirstCallback && age < 1.0
+        if sawFirstCallback && age > 1.0 {
+            scheduleRestart(after: 0, reason: "no IOProc callback for \(String(format: "%.1f", age)) s")
+        }
+    }
+}

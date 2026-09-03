@@ -84,3 +84,10 @@ public struct AggregateInputLayout: Hashable, Sendable {
         return (slot.bufferIndex, globalChannel - slot.firstGlobalChannel)
     }
 }
+
+// The arithmetic above is scope-agnostic: an aggregate's *output* buffer list
+// is laid out the same way, one buffer per sub-device output stream in
+// sub-device order. `AggregateDevice` builds both scopes from these types, so
+// these aliases give the output side a name that is not a lie.
+public typealias SubDeviceStreamLayout = SubDeviceInputLayout
+public typealias AggregateStreamLayout = AggregateInputLayout
