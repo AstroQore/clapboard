@@ -22,6 +22,7 @@ clap on every lane and writes the compensating delay into each one.
 | M4 Audio Unit hosting with latency compensation | done — every third-party AU on this Mac is Intel-only, so only Apple's have been exercised |
 | M5 Session persistence, missing-device handling | done |
 | M6 Virtual audio devices (Clapboard Bus 1…4, Core Audio HAL driver) | done — needs an install + coreaudiod restart to confirm on this Mac |
+| M7 Bus routing: model, RT graph, multi-output aggregate, session format 2 | done — headless only, no console UI yet |
 
 ## Build
 
@@ -147,6 +148,24 @@ capturing app.
 `Driver/README.md` has the object model, the ring/timeline arithmetic, the test
 harness and the signing/notarisation steps.
 
+## Routing
+
+Lanes no longer sum into one fixed master: they route to a **bus**, buses can
+feed other buses, and any bus can carry its own output device — several
+buses, several output devices, one private aggregate. Solo is scoped (a lane
+solo silences the other lanes on its bus; a bus solo silences its sibling
+buses) and plug-in delay compensation runs across the whole tree, not just
+per lane. `docs/ROUTING.md` is the full model; the engine API
+(`addBus`/`setBusDestination`/`setLaneDestination`/`setBusSolo`/…) and session
+format 2 are implemented and covered by the headless flags below — the
+console UI to reach it from the app itself has not been built yet, so today
+it is reachable only headlessly:
+
+```sh
+$BIN --engine-test 10 --output Loopback --lane "MacBook Pro Microphone" \
+    --bus Vocals --route "MacBook Pro Microphone"=Vocals --lane "Audio Hijack Input"
+$BIN --routing-selftest          # builds a two-output bus tree and checks it end to end
+```
 
 ## Session file
 
@@ -203,8 +222,11 @@ $BIN --effects-list
 $BIN --sync-test 8 --output Loopback --lane "Wireless Mic Rx" --lane "MacBook Pro Microphone" --apply   # clap when it says CLAP NOW
 $BIN --engine-test 5 --output Loopback --lane "MacBook Pro Microphone" --save-session --session-path /tmp/s.json
 $BIN --restore-session /tmp/s.json --run 3
+$BIN --restore-session /tmp/v1-session.json --run 0 --save-session --session-path /tmp/migrated.json  # v1 -> v2
 $BIN --session-dump
 $BIN --session-autosave-test
+$BIN --engine-test 10 --output Loopback --lane "MacBook Pro Microphone" --bus Vocals --route "MacBook Pro Microphone"=Vocals
+$BIN --routing-selftest
 ```
 
 Every mode destroys its private aggregate device on exit, including on
