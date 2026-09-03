@@ -1,0 +1,21 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Clapboard</title>
+        <item>
+            <title>0.1.0</title>
+            <pubDate>Thu, 03 Sep 2026 19:16:35 +0000</pubDate>
+            <link>https://github.com/AstroQore/clapboard/releases/tag/v0.1.0-dev.1</link>
+            <sparkle:channel>dev</sparkle:channel>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[# Clapboard 0.1.0 (dev)
+
+See the [full release notes](https://github.com/AstroQore/clapboard/releases/tag/v0.1.0-dev.1).
+]]></description>
+            <enclosure url="https://github.com/AstroQore/clapboard/releases/download/v0.1.0-dev.1/Clapboard-0.1.0-dev.1-macOS-arm64.zip" length="2648026" type="application/octet-stream" sparkle:edSignature="UtR8iK7ZA8eeJKAlWazwQZWh1So4CyOIfX1Buv2705X0vhb2lK7h8X0khytESnf9a9qJ0mVWcqc8upQJjJrkCg=="/>
+        </item>
+    </channel>
+</rss>
