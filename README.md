@@ -216,6 +216,45 @@ Clapboard --restore-session /tmp/session.json --run 5
 back — including which ones point at devices that are not here — and runs the
 engine for a few seconds, so the lane statuses are measured rather than assumed.
 
+## Projects
+
+The autosaved session above is what opens until you save a project. **Save
+As…** (⇧⌘S) writes the same document to a `.clapboard` file wherever you want
+it, and from then on the one-second autosave writes *that* file instead — so a
+setup you spent an evening on is a file you can name, keep and come back to.
+
+| | |
+|---|---|
+| **New** | ⌘N — stops the engine, empties the mixer to a single `Master`, goes back to autosaving the default session |
+| **Open…** | ⌘O — replaces the live graph; the engine stops, restores and restarts if it was running |
+| **Open Recent** | the last ten, from macOS's own recents list, with **Clear Menu** |
+| **Save** | ⌘S — autosave is debounced, this is the flush |
+| **Save As…** | ⇧⌘S — writes a `.clapboard` file and makes it the autosave target |
+
+The window title is `<project name> — Clapboard` with the standard edited dot
+while the mixer differs from the file on disk, the project file is the window's
+represented URL (so the proxy icon works), and the bar at the foot of the
+window names the project and says what the last save did.
+
+`.clapboard` files are declared in `Info.plist` as
+`com.astroqore.clapboard.project`, conforming to `public.json` — they are
+ordinary session JSON, so they double-click open, and you can still read, diff
+or repair one by hand.
+
+Two things worth knowing:
+
+- **New goes back to the default session.** A second after you choose it, the
+  empty mixer is autosaved over `session.json`. Clapboard asks first whenever
+  there is anything to lose and names the file, but that is what "New" means
+  here — save a project first if the current mixer matters.
+- **A recent entry whose file has moved** reports that and drops itself from
+  the menu rather than failing quietly.
+
+The last project is remembered and reopened on the next launch. If it has been
+moved or deleted by then, Clapboard falls back to the default session and says
+so in the project bar.
+
+
 ## Shortcuts and the menu bar
 
 The point of a mixer you run while streaming is that you never have to look at
@@ -273,11 +312,20 @@ $BIN --restore-session /tmp/s.json --run 3
 $BIN --restore-session /tmp/v1-session.json --run 0 --save-session --session-path /tmp/migrated.json  # v1 -> v2
 $BIN --session-dump
 $BIN --session-autosave-test
+$BIN --open-project "/tmp/Take One.clapboard"   # restore a project and print the graph
+$BIN --project-selftest                         # save / mutate / New / reopen, in a temp directory
 $BIN --hotkeys-selftest                 # register every binding, report per binding, release
 $BIN --hotkeys-selftest --hotkeys-path /tmp/hotkeys.json --reset
 $BIN --engine-test 10 --output Loopback --lane "MacBook Pro Microphone" --bus Vocals --route "MacBook Pro Microphone"=Vocals
 $BIN --routing-selftest
 ```
+
+`--project-selftest` builds a mixer, saves it as a project, proves the debounced
+autosave follows the project rather than the default session, starts a new
+session, reopens the project and asserts the graph came back identical — all
+inside a temporary directory, against an injected recents list and last-project
+pointer, so it cannot touch your real session file, preferences or Open Recent
+menu.
 
 `--hotkeys-selftest` loads the hotkey file (writing the default set when there
 is none), registers every binding with Carbon, prints `noErr` or the failure

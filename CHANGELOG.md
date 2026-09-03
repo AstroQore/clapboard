@@ -13,6 +13,14 @@ yet.
 
 ### Added
 
+- **Projects**: Save As / Open / Open Recent / New over `.clapboard` files
+  (the same JSON as the session, UTI `com.astroqore.clapboard.project`,
+  declared in `Info.plist` so they open on a double-click). The one-second
+  autosave follows the open project instead of the default session, the last
+  project reopens on the next launch — falling back to the default session, and
+  saying so, when it has been moved — and the window shows the project name with
+  the standard edited dot. Covered headlessly by `--open-project` and
+  `--project-selftest`.
 - Device registry and hot-plug handling: enumerates Core Audio devices,
   watches for changes, and keys everything by device UID rather than
   `AudioObjectID`.
