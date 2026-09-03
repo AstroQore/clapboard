@@ -77,6 +77,24 @@ yet.
   `+` works, exactly like a lane's. `addEffect(_:toLane:)` and
   `effects(forLane:)` remain as thin forwards.
 
+- **First-run setup assistant, and the virtual devices installed from inside
+  the app.** `Scripts/build_app.sh` now builds `ClapboardDriver.pkg` and its
+  uninstaller and copies them into `Contents/Resources` with a manifest
+  recording the driver's version, so nothing has to be built or downloaded by
+  hand; a driver that fails to build only costs the bundled installer, not the
+  app. A four-step sheet (welcome, microphone permission, virtual devices,
+  ready) opens on first launch, is skippable step by step, never blocks the
+  app, and is reachable afterwards from **Clapboard › Show Setup Assistant** /
+  **Set Up Virtual Devices…**. Installing hands the package to macOS's own
+  Installer with `NSWorkspace.open` — no `sudo`, no privileged helper, no
+  password field of Clapboard's own — after stopping the engine, then watches
+  for `Clapboard Bus 1` to appear. New `ClapboardCore` module `Driver/`:
+  `DriverVersion`, `DriverInstallationState`
+  (`notInstalled`/`installed`/`outdated`/`installerUnavailable`),
+  `DriverStatus` (which reports device *presence* separately, so a driver on
+  disk that `coreaudiod` has not loaded is distinguishable from a missing
+  one) and `SetupCompletion`. New headless flag `--driver-status`.
+
 ### Known limitations
 
 - No console UI for buses yet: the row-based mixer still runs against the
@@ -89,8 +107,12 @@ yet.
   came back loaded.
 - Projects (Save As / Open / Open Recent / a dirty-state title bar) are
   designed in `docs/ROUTING.md` but not implemented.
-- Global hotkeys, a virtual-device driver, and process-tap system-audio
-  capture are planned but not implemented yet — see `docs/ARCHITECTURE.md`.
+- Global hotkeys and process-tap system-audio capture are planned but not
+  implemented yet — see `docs/ARCHITECTURE.md`.
+- The setup assistant's *Install…* button has been verified up to the point
+  where Installer.app opens; the install itself, the `coreaudiod` restart and
+  the buses appearing have not been run on a development machine, because
+  installing needs the machine owner's administrator password.
 - No signed/notarized release build exists; see `SECURITY.md`.
 
 [Unreleased]: https://github.com/AstroQore/clapboard/commits/main

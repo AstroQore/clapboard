@@ -129,6 +129,37 @@ publishes four loopback devices — **Clapboard Bus 1** … **Clapboard Bus 4** 
 each 2-channel Float32 at 48 kHz (44.1 and 96 kHz are also offered). Whatever
 an app plays to a bus, another app captures from the same bus.
 
+### Installing them
+
+Nothing has to be built or downloaded by hand. `Scripts/build_app.sh` copies
+`ClapboardDriver.pkg` and its uninstaller into the app bundle, and the app
+offers to install them:
+
+- On first launch the **setup assistant** walks through what Clapboard is, the
+  microphone permission, and the virtual devices.
+- Any time afterwards: **Clapboard › Set Up Virtual Devices…**, or
+  **Clapboard › Show Setup Assistant** for the whole flow.
+
+Pressing *Install…* hands the package to macOS's own **Installer**, which
+shows what will be written and asks for the administrator password itself —
+Clapboard never sees it and never runs anything as root. Clapboard stops its
+engine first, because installing restarts `coreaudiod` and every audio app on
+the Mac loses its device connections for a moment. The assistant then watches
+for `Clapboard Bus 1` to appear and says so when it does. *Uninstall…* runs
+the payload-free uninstaller package the same way.
+
+`--driver-status` prints the same state from the command line:
+
+```
+$ .build/Clapboard.app/Contents/MacOS/Clapboard --driver-status
+state           notInstalled
+bundled         1.0.0 (short 1.0)
+devices         absent
+summary         Virtual devices are not installed. Clapboard can install them for you (driver 1.0.0).
+```
+
+### Building the driver (developer path)
+
 ```sh
 ./Scripts/build_driver.sh release            # -> .build/ClapboardDriver.driver
 ./Scripts/build_driver.sh release --harness  # + 253 offline checks, no coreaudiod
@@ -136,10 +167,12 @@ an app plays to a bus, another app captures from the same bus.
 open .build/ClapboardDriver.pkg              # Installer.app asks for the password
 ```
 
-Installing restarts `coreaudiod`, which drops every audio app's device
-connections for a moment. `./Scripts/install_driver.sh` validates the bundle and
-prints exactly what will happen without doing it; `./Scripts/uninstall_driver.sh`
-and `./Scripts/build_driver_uninstaller_pkg.sh` undo it.
+`./Scripts/build_app.sh` runs the two packaging scripts itself. If they fail,
+the app is still built — it just reports `installerUnavailable` and points at
+`Scripts/build_driver_pkg.sh`. `CLAPBOARD_SKIP_DRIVER_PKG=1` skips them
+deliberately. `./Scripts/install_driver.sh` validates the bundle and prints
+exactly what will happen without doing it; `./Scripts/uninstall_driver.sh` and
+`./Scripts/build_driver_uninstaller_pkg.sh` undo it.
 
 The devices are keyed by UID — `com.astroqore.Clapboard.bus.<n>`, model UID
 `com.astroqore.Clapboard.bus` — so the app's device registry recognises them
@@ -345,9 +378,10 @@ marks planned-but-not-implemented items (bus routing, hotkeys, a
 virtual-device driver, process taps) explicitly so this README doesn't have
 to be re-checked against the code to know what's real.
 
-**The virtual-device driver is planned, not implemented.** When it lands, it
-installs a HAL plug-in system-wide under `/Library/Audio/Plug-Ins/HAL` and
-requires administrator rights — see `docs/PERMISSIONS.md`.
+**The virtual-device driver installs system-wide.** It is a HAL plug-in under
+`/Library/Audio/Plug-Ins/HAL`, so installing it needs administrator rights and
+restarts `coreaudiod` for the whole machine. Clapboard offers it, macOS's
+Installer performs it — see `docs/PERMISSIONS.md`.
 
 Contributions are welcome — see `CONTRIBUTING.md` for the build/test/package
 verification steps, the real-time audio rules, and the PR checklist. Please

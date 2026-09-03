@@ -87,8 +87,13 @@ device another critical process depends on.
 Clapboard writes only to
 `~/Library/Application Support/Clapboard/session.json` (and its own
 `.tmp-*`/`.corrupt-*` siblings during atomic writes and quarantine — see
-`docs/ARCHITECTURE.md`). No other files are read or written, and no directory
-outside this one is touched.
+`docs/ARCHITECTURE.md`), plus a handful of window preferences in the standard
+`UserDefaults` domain `com.astroqore.Clapboard` — among them
+`setupAssistantCompletedVersion`, the app version that last finished the setup
+assistant. Those are preferences about this Mac rather than part of the mix,
+which is why they are not in the session file: copying a session to another
+machine must not tell that machine it is already set up. No other files are
+read or written, and no directory outside this one is touched.
 
 ## Planned: system-audio-capture permission (process taps)
 
@@ -103,13 +108,63 @@ the concrete flow once that work lands.
 
 ## Admin rights for the virtual-device driver
 
-A planned virtual-device driver (`DriverKit`/`AudioServerPlugin`, not
-implemented — see `docs/ARCHITECTURE.md`) will install a system extension or
-plug-in under `/Library/Audio/Plug-Ins/HAL`. Installing anything under
-`/Library` requires administrator authentication (a standard macOS admin
-password prompt, or an installer package requiring elevation) because it
-affects every user and every app on the machine, not just Clapboard. This is
-categorically different from the per-user, per-app Microphone permission
-above — treat it with the same caution you would any installer that asks for
-your admin password, and expect the installer to explain what it's adding
-before you approve it.
+`ClapboardDriver.driver` is a Core Audio `AudioServerPlugIn` that lives in
+`/Library/Audio/Plug-Ins/HAL` and publishes **Clapboard Bus 1** …
+**Clapboard Bus 4** (see `Driver/README.md`). Installing anything under
+`/Library` requires administrator authentication, because it affects every
+user and every app on the machine, not just Clapboard. This is categorically
+different from the per-user, per-app Microphone permission above.
+
+### How Clapboard asks
+
+`Scripts/build_app.sh` copies `ClapboardDriver.pkg` and
+`ClapboardDriverUninstaller.pkg` into the app bundle's `Contents/Resources`,
+alongside a small `ClapboardDriverInstaller.plist` that records the driver's
+version. The setup assistant — shown on first launch, and reachable any time
+from **Clapboard › Set Up Virtual Devices…** — offers to install it.
+
+Pressing *Install…* calls `NSWorkspace.open` on that package. That is the
+whole mechanism:
+
+- **macOS's own Installer** opens, shows its welcome pane describing what will
+  be written, and asks for the administrator password in a system window.
+- Clapboard **never sees the password**, never runs `sudo`, never calls
+  `do shell script … with administrator privileges`, and ships **no privileged
+  helper tool**. There is nothing in this app that can install anything by
+  itself.
+- Clapboard **stops its engine first**, because the package's `postinstall`
+  restarts `coreaudiod` and every audio connection on the Mac drops with it.
+- The assistant then watches the device list for up to three minutes and moves
+  to "installed" the moment `Clapboard Bus 1` appears. Cancelling at the
+  password prompt costs nothing; the assistant simply stops waiting.
+
+This is deliberately one click more than a privileged helper would need. An
+open-source audio app asking for a root password in a window of its own design
+is indistinguishable, to the person looking at it, from one that should not be
+trusted — so Clapboard does not do it.
+
+### The four states Clapboard reports
+
+`Sources/ClapboardCore/Driver/DriverInstallation.swift` reads the installed
+bundle's `Info.plist` and the bundled package's manifest and reports one of:
+
+| state | meaning |
+|---|---|
+| `notInstalled` | nothing under `/Library/Audio/Plug-Ins/HAL`; this build can install one |
+| `installed` | on disk, and not older than what this build carries |
+| `outdated` | on disk, but the app carries a newer package |
+| `installerUnavailable` | nothing on disk *and* no package in the app bundle — build one with `Scripts/build_driver_pkg.sh` |
+
+Whether the *devices are actually present* is reported separately, by asking
+the HAL for device UIDs beginning `com.astroqore.Clapboard.bus.`. A driver on
+disk that `coreaudiod` has not loaded is a real state and a common one right
+after an install: Clapboard shows a banner for it and offers to reopen the
+assistant. `.build/Clapboard.app/Contents/MacOS/Clapboard --driver-status`
+prints all of it for a support thread.
+
+### Removing it
+
+The assistant's *Uninstall…* opens `ClapboardDriverUninstaller.pkg`, a
+payload-free package whose `postinstall` deletes the driver, forgets the
+receipts and restarts `coreaudiod` — again with Installer.app asking for the
+password. `Scripts/uninstall_driver.sh` is the developer equivalent.
