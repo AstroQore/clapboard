@@ -91,6 +91,16 @@ public struct LaneRuntime: ~Copyable {
     /// instead of ramping up from silence.
     var primed: Bool = false
 
+    /// Auto Sync capture buffer, or `nil` on a lane the user left out of the
+    /// take. Allocated and freed by `RTEngineHost` on the main thread; the
+    /// render thread only appends to it, and only while `RTState.captureArmed`
+    /// is set. Plain fields, not atomics: they are written before the release
+    /// store that arms the capture and read after the acquire load that sees
+    /// it, so the handoff is already ordered.
+    var capture: UnsafeMutablePointer<Float>?
+    var captureCapacity: Int = 0
+    var captureWritten: Int = 0
+
     init(ring: UnsafeMutablePointer<Float>) {
         self.ring = ring
     }
@@ -192,6 +202,17 @@ public struct RTState: ~Copyable {
     /// Blocks the kernel refused (frames larger than `maxFramesPerBlock`).
     public let droppedBlocks = Atomic<UInt64>(0)
 
+    /// Auto Sync capture switch. Read once per block, before any lane runs, so
+    /// every selected lane records the same frames of the same IOProc cycle —
+    /// which is exactly the common time origin `LaneRecording` requires.
+    public let captureArmed = Atomic<Bool>(false)
+    /// Frames captured so far, published by the render thread for the UI's
+    /// progress bar and for the host's incremental reads of the buffers.
+    public let captureFrames = Atomic<Int>(0)
+    /// Frames the host asked for, and the capacity of every capture buffer.
+    /// Plain: written before `captureArmed` is released.
+    var captureRequestedFrames: Int = 0
+
     /// Master accumulators, `maxFramesPerBlock` floats each.
     var mixLeft: UnsafeMutablePointer<Float>
     var mixRight: UnsafeMutablePointer<Float>
@@ -258,6 +279,11 @@ public enum RTMemory {
     }
 
     public static func destroyLaneRuntime(_ runtime: UnsafeMutablePointer<LaneRuntime>) {
+        // A lane removed mid-capture takes its capture buffer with it.
+        if let capture = runtime.pointee.capture {
+            capture.deallocate()
+            runtime.pointee.capture = nil
+        }
         runtime.pointee.ring.deallocate()
         runtime.deinitialize(count: 1)
         runtime.deallocate()

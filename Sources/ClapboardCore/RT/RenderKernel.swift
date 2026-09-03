@@ -52,6 +52,11 @@ public func render(
     // only happen between two callbacks.
     state.pointee.enterGeneration.store(generation, ordering: .releasing)
 
+    // Auto Sync's capture switch is read exactly once per block: every lane
+    // then records the same frames of this cycle, which is what gives the
+    // recordings the common time origin the aligner assumes.
+    let capturing = state.pointee.captureArmed.load(ordering: .acquiring)
+
     let decay = state.pointee.meterDecayPerBlock
     if let lanes = graph.pointee.lanes {
         let laneCount = graph.pointee.laneCount
@@ -62,10 +67,20 @@ public func render(
                 state: state,
                 input: input,
                 frames: frames,
-                decay: decay
+                decay: decay,
+                capturing: capturing
             )
             index += 1
         }
+    }
+
+    if capturing {
+        // Published after the lanes wrote their samples, so a host that reads
+        // this count with acquire ordering can read that many samples safely.
+        let requested = state.pointee.captureRequestedFrames
+        var total = state.pointee.captureFrames.load(ordering: .relaxed) + frames
+        if total > requested { total = requested }
+        state.pointee.captureFrames.store(total, ordering: .releasing)
     }
 
     applyMasterGain(state: state, frames: frames)
@@ -92,7 +107,8 @@ private func renderLane(
     state: UnsafeMutablePointer<RTState>,
     input: UnsafePointer<AudioBufferList>?,
     frames: Int,
-    decay: Float
+    decay: Float,
+    capturing: Bool
 ) {
     let runtime = node.runtime
     let capacity = RTLimits.delayCapacity
@@ -136,6 +152,27 @@ private func renderLane(
         }
         channel += 1
     }
+
+    // --- 1b. Auto Sync: append this block's raw, pre-delay channel 0 to the
+    // lane's capture buffer. One load and one store per frame, nothing is
+    // allocated, and the buffer stops accepting samples once it is full.
+    if capturing, let capture = runtime.pointee.capture {
+        let written = runtime.pointee.captureWritten
+        var count = runtime.pointee.captureCapacity - written
+        if count > 0 {
+            if count > frames { count = frames }
+            var position = writeIndex
+            var frame = 0
+            while frame < count {
+                capture[written + frame] = ring[position]
+                position += 1
+                if position == capacity { position = 0 }
+                frame += 1
+            }
+            runtime.pointee.captureWritten = written + count
+        }
+    }
+
     runtime.pointee.writeIndex = (writeIndex + frames) % capacity
 
     // --- 2. Parameters.

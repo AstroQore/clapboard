@@ -8,6 +8,13 @@ struct MixerView: View {
     let permission: MicrophonePermission
 
     @State private var showingAddLane = false
+    @State private var showingAutoSync = false
+
+    /// Auto Sync measures lanes against each other and records what the IOProc
+    /// is already receiving, so it needs a running engine and two lanes.
+    private var canAutoSync: Bool {
+        engine.runState.isRunning && engine.lanes.count >= 2
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,6 +27,9 @@ struct MixerView: View {
         .sheet(isPresented: $showingAddLane) {
             AddLaneSheet(engine: engine, registry: registry)
         }
+        .sheet(isPresented: $showingAutoSync) {
+            AutoSyncSheet(engine: engine, registry: registry)
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -31,6 +41,17 @@ struct MixerView: View {
                     )
                 }
                 .disabled(engine.runState.isBusy || engine.outputDeviceUID == nil)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showingAutoSync = true
+                } label: {
+                    Label("Auto Sync", systemImage: "hands.clap")
+                }
+                .disabled(!canAutoSync)
+                .help(canAutoSync
+                      ? "Clap once; Clapboard measures each lane's arrival and writes the compensating delay"
+                      : "Run the engine with at least two lanes first")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -86,23 +107,14 @@ struct MixerView: View {
             }
 
             Spacer()
-
-            if engine.delaysMayBeStale {
-                // Drift compensation puts a resampler in front of every input
-                // sub-device; its latency is unreported and moves when the
-                // aggregate is rebuilt, so measured delays have to be re-taken.
-                Button {
-                    engine.acknowledgeStaleDelays()
-                } label: {
-                    Label("Delays may be stale — re-measure", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.orange)
-            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
+    }
+
+    /// Largest delay any lane is carrying, in ms — the span Auto Sync closed.
+    private var spreadMilliseconds: Double {
+        Double(engine.lanes.map(\.delaySamples).max() ?? 0) / engine.sampleRate * 1000
     }
 
     private var statusColor: Color {
@@ -190,6 +202,37 @@ struct MixerView: View {
                 LiveMeter(isLive: engine.runState.isRunning, read: { engine.masterMeter }, height: 12)
                     .frame(minWidth: 120)
                 MeterReadout(isLive: engine.runState.isRunning) { engine.masterMeter }
+            }
+
+            HStack(spacing: 10) {
+                Label(
+                    String(format: "sync spread %.1f ms", spreadMilliseconds),
+                    systemImage: "arrow.left.and.right"
+                )
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .help("Largest lane delay currently written into the mix")
+
+                if engine.delaysMayBeStale {
+                    // Drift compensation puts a resampler in front of every
+                    // input sub-device; its latency is unreported and moves
+                    // when the aggregate is rebuilt, so measured delays have to
+                    // be re-taken.
+                    Button {
+                        showingAutoSync = true
+                    } label: {
+                        Label("Delays may be stale — re-measure", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.orange)
+                    .disabled(!canAutoSync)
+
+                    Button("Dismiss") { engine.acknowledgeStaleDelays() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                }
+                Spacer()
             }
 
             if let error = engine.lastError {

@@ -11,6 +11,12 @@ struct LaneRowView: View {
         engine.laneStatus[lane.id] ?? .idle
     }
 
+    /// A rebuilt aggregate moves the drift resampler's unreported latency, so
+    /// a delay measured before it is no longer trustworthy.
+    private var delayIsStale: Bool {
+        engine.delaysMayBeStale && lane.delaySamples > 0
+    }
+
     private var deviceName: String {
         registry.device(uid: lane.deviceUID)?.name ?? lane.deviceUID
     }
@@ -145,8 +151,11 @@ struct LaneRowView: View {
             .help("± 0.1 ms — about 5 samples at 48 kHz")
             Text("\(lane.delaySamples) sp")
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(delayIsStale ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
                 .frame(width: 52, alignment: .leading)
+                .help(delayIsStale
+                      ? "The aggregate device was rebuilt after this delay was measured — run Auto Sync again"
+                      : "Delay in whole samples at 48 kHz")
         }
     }
 }

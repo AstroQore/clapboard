@@ -27,6 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || CommandLine.arguments.contains("--session-autosave-test") {
             SessionSmokeTest.run(arguments: Array(CommandLine.arguments.dropFirst()))
         }
+        if CommandLine.arguments.contains("--sync-test") {
+            SyncSmokeTest.run(arguments: Array(CommandLine.arguments.dropFirst()))
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
     }
