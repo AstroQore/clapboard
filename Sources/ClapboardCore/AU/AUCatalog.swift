@@ -88,7 +88,8 @@ extension AUComponentInfo {
             componentFlagsMask: description.componentFlagsMask,
             hasCustomView: component.hasCustomView,
             isSandboxSafe: component.isSandboxSafe,
-            tags: component.allTagNames
+            tags: component.allTagNames,
+            bundleURL: component.componentURL
         )
     }
 }

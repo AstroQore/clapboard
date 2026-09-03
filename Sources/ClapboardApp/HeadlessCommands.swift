@@ -7,6 +7,7 @@ enum HeadlessCommand {
     static let flags: Set<String> = [
         "--list-devices",
         "--engine-test",
+        "--effects-list",
         "--sync-test",
         "--restore-session",
         "--session-dump",
@@ -22,6 +23,9 @@ enum HeadlessCommand {
         if arguments.contains("--list-devices") {
             printDevicesAndExit()
         }
+        if arguments.contains("--effects-list") {
+            printEffectsAndExit()
+        }
         if arguments.contains("--engine-test") {
             EngineSmokeTest.run(arguments: arguments)
         }
@@ -35,6 +39,40 @@ enum HeadlessCommand {
         }
         FileHandle.standardError.write(Data("unknown headless flag\n".utf8))
         exit(64)
+    }
+
+    /// Dumps every installed Audio Unit effect, with the reason Clapboard
+    /// cannot host it where that applies. On an Apple Silicon Mac that reason
+    /// is nearly always the same one: an AUv2 bundle with no arm64 slice.
+    private static func printEffectsAndExit() -> Never {
+        let effects = AUCatalog.effects()
+        var unavailable = 0
+        for effect in effects {
+            let kind = effect.isAUv3 ? "AUv3" : "AUv2"
+            let arch: String
+            if effect.isAUv3 {
+                arch = "-"
+            } else if let url = effect.bundleURL,
+                      let types = Bundle(url: url)?.executableURL.flatMap(MachOArchitecture.cpuTypes(inFileAt:)) {
+                arch = types.map(name(cpuType:)).joined(separator: "+")
+            } else {
+                arch = "?"
+            }
+            let reason = AUAvailability.reason(for: effect)
+            if reason != nil { unavailable += 1 }
+            print("\(effect.id)\t\(kind)\t\(arch)\t\(effect.manufacturerName)\t\(effect.name)"
+                + "\t\(effect.versionString)" + (reason.map { "\tUNAVAILABLE: \($0)" } ?? ""))
+        }
+        print("\(effects.count) effects, \(unavailable) unavailable")
+        exit(0)
+    }
+
+    private static func name(cpuType: UInt32) -> String {
+        switch cpuType {
+        case MachOArchitecture.arm64: return "arm64"
+        case MachOArchitecture.x86_64: return "x86_64"
+        default: return String(format: "0x%08x", cpuType)
+        }
     }
 
     /// Dumps every Core Audio device the HAL reports and exits.

@@ -76,7 +76,12 @@ final class Rig {
         return id
     }
 
-    func publish(_ nodes: [(id: UUID, sources: [(Int, Int, Int)])], outputBufferIndex: Int = 0) {
+    func publish(
+        _ nodes: [(id: UUID, sources: [(Int, Int, Int)])],
+        outputBufferIndex: Int = 0,
+        laneEffects: [[UUID]] = [],
+        masterEffects: [UUID] = []
+    ) {
         let laneNodes = nodes.map { entry -> RTLaneNode in
             let first = entry.sources[0]
             let second = entry.sources.count > 1 ? entry.sources[1] : nil
@@ -91,7 +96,13 @@ final class Rig {
                 channelsInBuffer1: second?.2 ?? 0
             )
         }
-        host.publish(nodes: laneNodes, outputBufferIndex: outputBufferIndex, outputChannelsInBuffer: 2)
+        host.publish(
+            nodes: laneNodes,
+            outputBufferIndex: outputBufferIndex,
+            outputChannelsInBuffer: 2,
+            laneEffectIDs: laneEffects,
+            masterEffectIDs: masterEffects
+        )
     }
 
     /// Renders one block and returns the master left/right it produced.

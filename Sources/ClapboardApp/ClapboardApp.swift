@@ -19,6 +19,12 @@ struct ClapboardApp: App {
                     permission.refresh()
                     engine.refreshAuthorization()
                     engine.attach(registry: registry)
+                    // Plug-in editor windows are AppKit, and `ClapboardCore`
+                    // has none. Closing before teardown is a hard requirement:
+                    // the view keeps drawing from the plug-in's render
+                    // resources, which `teardown()` releases.
+                    engine.onShowEffectWindow = { AUPluginWindowController.shared.show($0) }
+                    engine.onCloseEffectWindow = { AUPluginWindowController.shared.close($0) }
                     // Restore before falling back to the default output, so a
                     // saved output device wins over whatever macOS is pointing
                     // at today. Autosave starts once this returns.

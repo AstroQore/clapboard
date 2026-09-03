@@ -19,7 +19,7 @@ clap on every lane and writes the compensating delay into each one.
 | M1 Multi-device capture + mix + output (private aggregate device, HAL IOProc) | done |
 | M2 Per-lane gain / switch / delay / polarity, meters | done |
 | M3 Auto Sync (onset detection + band-limited GCC-PHAT, results sheet, verify) | done — acoustic accuracy still to be confirmed with a real clap |
-| M4 Audio Unit hosting with latency compensation | in progress |
+| M4 Audio Unit hosting with latency compensation | done — every third-party AU on this Mac is Intel-only, so only Apple's have been exercised |
 | M5 Session persistence, missing-device handling | done |
 
 ## Build
@@ -50,8 +50,73 @@ It exits non-zero if an aggregate device survives the teardown. Add
 `--ignore-tcc` to exercise everything except real capture on a machine where
 the microphone prompt has not been answered.
 
+`--lane-effect <name-or-id>` inserts an Audio Unit into the lane named by the
+preceding `--lane`, `--master-effect` into the master chain, and `--bypass-at
+<sec>` toggles every inserted effect once. Each second it then prints each
+lane's chain, its latency, the compensation on top and the delay actually
+written to the render thread, so plug-in delay compensation can be checked
+from a script.
+
 Always run the `.app`, never `swift run`: microphone access is granted to a
 bundle identifier, and a bare executable has none.
+
+## Effects
+
+Every lane has an Audio Unit chain — after the delay line, before the fader —
+and the master bus has one of its own, after the sum and before the master
+gain. Chips under a lane's controls are the chain: click one to bypass it,
+double-click for the plug-in's own editor, right-click to reorder or remove,
+`+` to insert. Editing a chain while the mix is running is a graph snapshot
+swap, the same click-free mechanism adding a lane uses, and bypass is
+crossfaded over 10 ms rather than switched.
+
+**Delay compensation.** A look-ahead plug-in makes its lane come out late, so
+Clapboard delays every other lane to match:
+
+```
+lane delay written to the render thread
+    = lane.delaySamples                        # manual, or what Auto Sync measured
+    + (slowest lane's chain latency − this lane's chain latency)
+```
+
+The manual value is left exactly as it was measured; compensation is added on
+top, and each lane shows how much as `PDC +N sp`. Bypass is a real
+pass-through — the plug-in stops rendering, so its latency goes away too — and
+the compensation is recomputed every time one is toggled, a plug-in reports a
+new latency, or a chain is edited. The master chain is common to every lane,
+so it is not compensated at all, only reported: the master bar shows the total
+as `output latency N ms`. If compensation would push a lane past the delay
+line's 1000 ms ceiling it is clamped and the mixer says so.
+
+Chains live in the session file, in the `laneExtras` / `masterExtras` bags, as
+`{id, componentID, bypass, displayName, fullState}` with each plug-in's state
+as a base64 binary property list. Effect ids survive a relaunch. A plug-in the
+Mac no longer has comes back as a greyed placeholder that keeps its saved
+state, so opening a session on a machine without the plug-in and saving it
+again does not throw the settings away.
+
+### Intel-only plug-ins
+
+An AUv2 plug-in is loaded into Clapboard's own process or not at all. On an
+Apple Silicon Mac a bundle with no `arm64` slice therefore cannot be hosted:
+macOS answers by starting a Rosetta hosting service, and a plug-in in there
+never finishes `allocateRenderResources()`, which would wedge the main thread.
+Clapboard reads each AUv2 bundle's Mach-O header up front, greys those entries
+in the plug-in menu with the reason, and refuses them rather than hanging.
+
+On this machine that is **every third-party effect installed** — the whole
+Ozone 9 suite, Melodyne, Relay, Tonal Balance Control. Only Apple's own units
+(all of them universal) can be exercised here, which is what M4's tests use.
+`--effects-list` prints the verdict for each:
+
+```sh
+$BIN --effects-list
+aufx.dely.appl	AUv2	x86_64+arm64	Apple	AUDelay	1.6.0
+aufx.ZnO9.iZtp	AUv2	x86_64	iZotope	Ozone 9	9.1.0	UNAVAILABLE: Intel-only AUv2 — …
+```
+
+AUv3 plug-ins are app extensions and are not affected; Clapboard loads one
+in-process when it can and out of process otherwise.
 
 ## Session file
 
@@ -103,6 +168,8 @@ window:
 BIN=.build/Clapboard.app/Contents/MacOS/Clapboard
 $BIN --list-devices
 $BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" --rebuild-at 8 --hot-lane "监听"
+$BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane-effect AUPeakLimiter --lane "Audio Hijack Input" --master-effect AUDelay --bypass-at 10
+$BIN --effects-list
 $BIN --sync-test 8 --output Loopback --lane "Wireless Mic Rx" --lane "MacBook Pro Microphone" --apply   # clap when it says CLAP NOW
 $BIN --engine-test 5 --output Loopback --lane "MacBook Pro Microphone" --save-session --session-path /tmp/s.json
 $BIN --restore-session /tmp/s.json --run 3

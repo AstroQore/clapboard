@@ -165,6 +165,12 @@ enum SessionSmokeTest {
         let report = engine.restore(document)
         say("restore  \(report.summary)")
         for note in report.skippedLanes { say("skipped  \(note)") }
+        // Chains are instantiated asynchronously — loading a plug-in is slow —
+        // so the run loop has to turn before the mixer is really back.
+        if report.pendingEffects > 0 {
+            let waited = waitUntil(timeout: 60) { !engine.restoringEffects }
+            say("effects  \(waited ? "loaded" : "TIMED OUT") after \(report.pendingEffects) requested")
+        }
 
         let present = Set(registry.devices.map(\.uid))
         say("output   \(describeDevice(engine.outputDeviceUID, registry: registry))")
@@ -176,6 +182,15 @@ enum SessionSmokeTest {
                 + "enabled=\(lane.enabled) polarity=\(lane.polarityInverted ? "inverted" : "normal") "
                 + "device=\(present.contains(lane.deviceUID) ? "present" : "MISSING") "
                 + "uid=\(lane.deviceUID) id=\(lane.id)")
+            for effect in engine.effects(forLane: lane.id) {
+                sayEffect(effect, on: "lane", engine: engine)
+            }
+        }
+        for effect in engine.masterEffects { sayEffect(effect, on: "master", engine: engine) }
+        if !engine.laneEffects.isEmpty || !engine.masterEffects.isEmpty {
+            say("latency  out=\(engine.outputLatencySamples) sp "
+                + String(format: "(%.2f ms)", engine.outputLatencyMilliseconds)
+                + engine.lanes.map { " \(short($0.name)) pdc=+\(engine.pdcSamples[$0.id] ?? 0)sp" }.joined())
         }
 
         guard runSeconds > 0 else { exit(0) }
@@ -214,23 +229,66 @@ enum SessionSmokeTest {
         let after = engine.sessionSnapshot
         let sameLanes = after.lanes == document.lanes
         let sameOutput = after.outputDeviceUID == document.outputDeviceUID
-        say("stable   lanes=\(sameLanes) output=\(sameOutput) master=\(after.masterGainDB == document.masterGainDB)")
+        // Effect ids have to survive: everything keyed on them — the chain
+        // order, each plug-in's saved state — hangs off that.
+        let before = chainIdentities(document)
+        let now = chainIdentities(after)
+        let sameChains = before == now
+        say("stable   lanes=\(sameLanes) output=\(sameOutput) master=\(after.masterGainDB == document.masterGainDB) "
+            + "chains=\(sameChains) (\(before.count) effect(s))")
 
         engine.shutdown()
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
         let leftovers = ((try? AudioDeviceInfo.enumerateAll()) ?? [])
             .filter { $0.uid.hasPrefix("com.astroqore.Clapboard.aggregate.") || $0.name == "Clapboard Mix" }
         say("leftover aggregates after shutdown: \(leftovers.count)")
-        exit(leftovers.isEmpty && sameLanes && sameOutput ? 0 : 2)
+        exit(leftovers.isEmpty && sameLanes && sameOutput && sameChains ? 0 : 2)
     }
 
     // MARK: - Helpers
+
+    @MainActor
+    @discardableResult
+    private static func waitUntil(timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        return condition()
+    }
+
+    @MainActor
+    private static func sayEffect(_ effect: EffectConfig, on bus: String, engine: AudioEngine) {
+        say("effect   \(bus): \(effect.displayName) [\(effect.componentID)] "
+            + "id=\(effect.id) bypass=\(effect.bypass) "
+            + "latency=\(engine.effectLatencySamples(id: effect.id))sp "
+            + "state=\(effect.isAvailable ? "loaded" : "UNAVAILABLE: \(effect.unavailableReason ?? "")")")
+    }
+
+    /// `(id, componentID, bypass)` for every effect in a document, master last.
+    private static func chainIdentities(_ document: SessionDocument) -> [String] {
+        var result: [String] = []
+        for lane in document.lanes {
+            let chain = EffectChainCodec.decode(
+                document.laneExtras[lane.id.uuidString]?[EffectChainCodec.extrasKey])
+            result += chain.map { "\(lane.id):\($0.id):\($0.componentID):\($0.bypass)" }
+        }
+        result += EffectChainCodec
+            .decode(document.masterExtras[EffectChainCodec.extrasKey])
+            .map { "master:\($0.id):\($0.componentID):\($0.bypass)" }
+        return result
+    }
 
     private static func describe(_ document: SessionDocument) {
         say("format   \(document.formatVersion)\(document.isFromNewerFormat ? " (NEWER than this build understands)" : "")")
         say("savedAt  \(ISO8601DateFormatter().string(from: document.savedAt))")
         say("lanes    \(document.lanes.count)  output=\(document.outputDeviceUID ?? "-")  "
             + String(format: "master=%.1f dB", document.masterGainDB))
+        let chains = chainIdentities(document)
+        if !chains.isEmpty {
+            say("effects  \(chains.count) in the file: \(chains.joined(separator: " "))")
+        }
     }
 
     @MainActor

@@ -20,12 +20,26 @@ import Foundation
 ///     Clapboard --engine-test 5 --output Loopback --lane "…" \
 ///         --save-session --session-path /tmp/session.json
 ///     Clapboard --restore-session /tmp/session.json
+///
+/// M4: `--lane-effect <name-or-id>` inserts an Audio Unit into the lane named
+/// by the preceding `--lane`, `--master-effect` into the master chain, and
+/// `--bypass-at <sec>` toggles every inserted effect once, so the crossfade
+/// and the delay compensation that follows a bypass can be checked from a
+/// script:
+///
+///     Clapboard --engine-test 20 --output Loopback \
+///         --lane "MacBook Pro Microphone" --lane-effect AUDelay \
+///         --lane "Audio Hijack Input" --master-effect AUPeakLimiter --bypass-at 10
 enum EngineSmokeTest {
     @MainActor
     static func run(arguments: [String]) -> Never {
         var seconds = 10.0
         var outputQuery: String?
         var laneQueries: [String] = []
+        /// Effects to insert into each lane, parallel to `laneQueries`.
+        var laneEffectQueries: [[String]] = []
+        var masterEffectQueries: [String] = []
+        var bypassAt: Double?
         var hotLaneQuery: String?
         var rebuildAt: Double?
         var ignoreTCC = false
@@ -42,7 +56,19 @@ enum EngineSmokeTest {
             switch argument {
             case "--engine-test": seconds = Double(next() ?? "10") ?? 10
             case "--output": outputQuery = next()
-            case "--lane": if let value = next() { laneQueries.append(value) }
+            case "--lane":
+                if let value = next() {
+                    laneQueries.append(value)
+                    laneEffectQueries.append([])
+                }
+            // Attaches to the most recent `--lane`, so the flag order on the
+            // command line is the chain order in the mixer.
+            case "--lane-effect":
+                if let value = next(), !laneEffectQueries.isEmpty {
+                    laneEffectQueries[laneEffectQueries.count - 1].append(value)
+                }
+            case "--master-effect": if let value = next() { masterEffectQueries.append(value) }
+            case "--bypass-at": bypassAt = Double(next() ?? "")
             case "--hot-lane": hotLaneQuery = next()
             case "--rebuild-at": rebuildAt = Double(next() ?? "")
             case "--ignore-tcc": ignoreTCC = true
@@ -70,6 +96,7 @@ enum EngineSmokeTest {
         engine.setOutputDevice(uid: output.uid)
         say("output   \(output.name) [\(output.uid)]")
 
+        var laneIDs: [UUID] = []
         for query in laneQueries {
             // "Device Name#2" takes channel 2, "Device Name#1,2" the stereo
             // pair. A bare name takes channel 1. `#` rather than `:` because
@@ -86,8 +113,25 @@ enum EngineSmokeTest {
                 fail("--lane \(query) asks for a channel \(device.name) does not have (\(device.inputChannels))")
             }
             let label = channels.map { String($0 + 1) }.joined(separator: "/")
-            engine.addLane(deviceUID: device.uid, deviceChannels: channels, name: "\(device.name) \(label)")
+            let lane = engine.addLane(
+                deviceUID: device.uid, deviceChannels: channels, name: "\(device.name) \(label)")
+            laneIDs.append(lane.id)
             say("lane     \(device.name) ch\(label) [\(device.uid)]")
+        }
+
+        // Effects go in before the engine starts, so the very first block the
+        // IOProc renders already has the chains and the compensation in place.
+        var effectIDs: [UUID] = []
+        for (index, queries) in laneEffectQueries.enumerated() where index < laneIDs.count {
+            for query in queries {
+                effectIDs.append(insertEffect(query, into: laneIDs[index], engine: engine))
+            }
+        }
+        for query in masterEffectQueries {
+            effectIDs.append(insertEffect(query, into: nil, engine: engine))
+        }
+        if !effectIDs.isEmpty {
+            say("latency  " + latencyLine(engine))
         }
 
         // TCC: without it the HAL hands the IOProc zeros rather than an error,
@@ -114,6 +158,8 @@ enum EngineSmokeTest {
         say("aggregate \(engine.aggregateSummary ?? "-")")
 
         var didRebuild = rebuildAt == nil
+        var didBypass = bypassAt == nil
+        var overloadsBeforeBypass = 0
         var didHotAdd = hotLaneQuery == nil
         var hotLaneID: UUID?
         var worstCallbackAge = 0.0
@@ -141,6 +187,25 @@ enum EngineSmokeTest {
                 callbacks, perSecond, engine.overloadCount, engine.droppedBlocks,
                 engine.secondsSinceLastCallback, meters.joined(separator: " ")
             ))
+
+            if !effectIDs.isEmpty {
+                say("         " + latencyLine(engine))
+            }
+
+            if let bypassAt, !didBypass, elapsed >= bypassAt {
+                didBypass = true
+                overloadsBeforeBypass = engine.overloadCount
+                for id in effectIDs {
+                    let now = !(engine.effectConfig(id: id)?.bypass ?? false)
+                    engine.setEffectBypass(id: id, now)
+                }
+                say("BYPASS   toggled \(effectIDs.count) effect(s); " + latencyLine(engine))
+            } else if bypassAt != nil, didBypass, overloadsBeforeBypass >= 0,
+                      elapsed >= (bypassAt ?? 0) + 2 {
+                say("BYPASS   overloads \(overloadsBeforeBypass) -> \(engine.overloadCount) "
+                    + "two seconds after the toggle")
+                overloadsBeforeBypass = -1
+            }
 
             if let rebuildAt, !didRebuild, elapsed >= rebuildAt {
                 didRebuild = true
@@ -175,6 +240,10 @@ enum EngineSmokeTest {
             + "worstCallbackAge=\(String(format: "%.3f", worstCallbackAge))s "
             + "state=\(engine.runState.label)")
 
+        if let warning = engine.pdcWarning {
+            say("PDC WARN \(warning)")
+        }
+
         if saveSession {
             guard let store = SessionSmokeTest.store(path: sessionPath) else {
                 fail("macOS reports no Application Support directory; pass --session-path")
@@ -195,6 +264,77 @@ enum EngineSmokeTest {
             .filter { $0.uid.hasPrefix("com.astroqore.Clapboard.aggregate.") || $0.name == "Clapboard Mix" }
         say("leftover aggregates after shutdown: \(leftovers.count)")
         exit(leftovers.isEmpty ? 0 : 2)
+    }
+
+    // MARK: - Effects
+
+    /// Resolves a plug-in by `AUComponentInfo.id`, exact name, or a
+    /// case-insensitive substring, then inserts it and waits for it to load.
+    @MainActor
+    private static func insertEffect(_ query: String, into laneID: UUID?, engine: AudioEngine) -> UUID {
+        let catalog = AUCatalog.effects()
+        guard let info = catalog.first(where: { $0.id == query })
+            ?? catalog.first(where: { $0.name == query })
+            ?? catalog.first(where: { $0.name.localizedCaseInsensitiveContains(query) })
+            ?? catalog.first(where: { $0.displayName.localizedCaseInsensitiveContains(query) })
+        else {
+            fail("--lane-effect/--master-effect \(query) matched no installed Audio Unit; "
+                + "run --effects-list to see what is here")
+        }
+        if let reason = AUAvailability.reason(for: info) {
+            fail("\(info.displayName): \(reason)")
+        }
+        var outcome: Result<EffectConfig, any Error>?
+        Task { @MainActor in
+            do {
+                outcome = .success(try await engine.addEffect(info, toLane: laneID))
+            } catch {
+                outcome = .failure(error)
+            }
+        }
+        _ = waitUntil(timeout: 30) { outcome != nil }
+        switch outcome {
+        case .success(let config):
+            let where_ = laneID == nil ? "master" : "lane"
+            say("effect   \(where_) += \(info.displayName) "
+                + "[\(engine.effectLatencySamples(id: config.id)) sp latency]")
+            return config.id
+        case .failure(let error):
+            fail("could not load \(info.displayName): \(error)")
+        case nil:
+            fail("\(info.displayName) did not finish loading in 30 s")
+        }
+    }
+
+    /// Per-lane chain, chain latency, the compensation added on top, and what
+    /// the render thread's delay line is actually set to.
+    @MainActor
+    private static func latencyLine(_ engine: AudioEngine) -> String {
+        var parts: [String] = []
+        for lane in engine.lanes {
+            let chain = engine.effects(forLane: lane.id)
+            let names = chain.isEmpty
+                ? "-"
+                : chain.map { config in
+                    let short = config.displayName.split(separator: ":").last.map(String.init)
+                        ?? config.displayName
+                    return short.trimmingCharacters(in: .whitespaces)
+                        + (config.bypass ? "(byp)" : "")
+                }.joined(separator: ">")
+            parts.append(String(
+                format: "%@[%@ chain=%dsp pdc=+%dsp delay=%dsp]",
+                short(lane.name), names,
+                engine.laneChainLatency(lane.id),
+                engine.pdcSamples[lane.id] ?? 0,
+                engine.effectiveDelaySamples(forLane: lane.id)))
+        }
+        if !engine.masterEffects.isEmpty {
+            parts.append("master[\(engine.masterEffects.map(\.displayName).joined(separator: ">")) "
+                + "chain=\(engine.masterChainLatency)sp]")
+        }
+        parts.append(String(format: "out=%dsp/%.2fms",
+                            engine.outputLatencySamples, engine.outputLatencyMilliseconds))
+        return parts.joined(separator: "  ")
     }
 
     // MARK: - Helpers
