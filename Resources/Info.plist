@@ -49,7 +49,7 @@
 	<!-- PLACEHOLDER — replace with the output of Sparkle's generate_keys.
 	     Never commit the matching private key; see RELEASING.md step 1. -->
 	<key>SUPublicEDKey</key>
-	<string>REPLACE_ME_WITH_SPARKLE_PUBLIC_ED_KEY</string>
+	<string>2xO9t72QGW9qpbToOTBayktr2QB70PIvFMJJTY+fyUk=</string>
 	<key>SUScheduledCheckInterval</key>
 	<integer>86400</integer>
 	<key>SUShowReleaseNotes</key>
