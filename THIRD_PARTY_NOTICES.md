@@ -2,13 +2,31 @@
 
 ## Direct dependencies
 
-None. `Package.swift` declares no external package dependencies — Clapboard
-links only against Apple's system frameworks (CoreAudio, AudioToolbox,
-AVFoundation, Accelerate, Synchronization, SwiftUI/AppKit), which ship with
-the OS and are not vendored or redistributed by this repository.
+### Sparkle 2.9.4
 
-If a dependency is ever added, it will be listed here alongside its license,
-kept in step with `Package.swift`/`Package.resolved`.
+- Project: [sparkle-project/Sparkle](https://github.com/sparkle-project/Sparkle)
+- Use in Clapboard: in-app update discovery, EdDSA appcast signature
+  verification, and update installation — **Clapboard › Check for Updates…**
+  and the Main/Dev channels described in `RELEASING.md`.
+- How it is consumed: pinned to an exact version in `Package.swift` and, unlike
+  everything else Clapboard links, **redistributed as a binary**.
+  `Scripts/build_app.sh` copies `Sparkle.framework` into
+  `Clapboard.app/Contents/Frameworks` — including its `Autoupdate` helper,
+  `Updater.app`, and the `Installer.xpc` / `Downloader.xpc` XPC services — so
+  the notice below travels with the binary and not only with this repository.
+- License: [MIT](Resources/ThirdPartyLicenses/Sparkle.txt)
+  ([upstream](https://github.com/sparkle-project/Sparkle/blob/2.9.4/LICENSE)).
+  The bundled file is Sparkle's own `LICENSE`, verbatim, which also carries the
+  notices for the external components Sparkle itself vendors.
+
+Apart from Sparkle, Clapboard links only against Apple's system frameworks
+(CoreAudio, AudioToolbox, AVFoundation, Accelerate, Synchronization,
+SwiftUI/AppKit), which ship with the OS and are not vendored or redistributed
+by this repository.
+
+If another dependency is ever added, list it here alongside its license, keep
+it in step with `Package.swift`, and put the license text under
+`Resources/ThirdPartyLicenses/` so `Scripts/build_app.sh` ships it.
 
 ## Ported or adapted source
 
