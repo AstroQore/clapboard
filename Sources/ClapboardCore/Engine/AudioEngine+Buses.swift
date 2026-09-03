@@ -142,6 +142,93 @@ extension AudioEngine {
         latencyPlan.outputLatency[uid] ?? 0
     }
 
+    // MARK: - Read-only queries for the console UI
+
+    /// Which strips are actually audible right now:
+    /// `!muted && (nothing in its scope is soloed || it is soloed)`, for every
+    /// lane and every bus.
+    ///
+    /// This is the same computation `refreshEffectiveEnable()` pushes into the
+    /// render thread's atomics, and it exists because the console has to *look*
+    /// like what you hear: a lane silenced because a sibling is soloed is drawn
+    /// dimmed while its own `S` stays off. The alternative — re-running
+    /// `SoloLogic` in the view — is not open to it, since scope comes from
+    /// `graph`, which is internal to this module. Nothing here mutates; a
+    /// caller that wants the render thread updated still goes through
+    /// `setLaneMuted`/`setBusSolo`/….
+    public var effectiveEnable: (lanes: [UUID: Bool], buses: [UUID: Bool]) {
+        SoloLogic.effectiveEnabled(lanes: lanes, buses: buses, graph: graph)
+    }
+
+    /// Buses in console order: children before the bus they feed, so signal
+    /// runs left to right across the strips and `Master` sits at the far end.
+    ///
+    /// This is `RoutingGraph.order` — the same order the render thread
+    /// processes buses in — resolved to configs. Any bus the current graph
+    /// does not know about (only reachable when `routingError` is set and the
+    /// last good graph is being kept) is appended rather than dropped, because
+    /// a strip vanishing from the console is a worse failure than a strip in
+    /// the wrong place.
+    public var consoleBusOrder: [BusConfig] {
+        var seen = Set<UUID>()
+        var ordered: [BusConfig] = []
+        ordered.reserveCapacity(buses.count)
+        for id in graph.order {
+            guard seen.insert(id).inserted, let bus = bus(id: id) else { continue }
+            ordered.append(bus)
+        }
+        for bus in buses where !seen.contains(bus.id) { ordered.append(bus) }
+        return ordered
+    }
+
+    /// Is this the bus the `masterGainDB` / `masterMeter` / `masterEffects` /
+    /// `setOutputDevice` shims point at? The console asks because that bus is
+    /// the only one whose effect chain can be edited today, and because
+    /// `removeBus` will refuse it.
+    public func isMasterBus(_ id: UUID) -> Bool { id == masterBusID }
+
+    /// The loop that routing `id` into `parent` would close, named strip by
+    /// strip in the order it is walked and closed (`["A", "B", "A"]`), or `nil`
+    /// when the edit is legal.
+    ///
+    /// `setBusDestination` only reports *that* an edit would loop;
+    /// `RoutingError.cycle` is what actually names the path, and it is only
+    /// raised by building a graph. This builds a throw-away one from a
+    /// candidate copy of `buses` — nothing is mutated and the live graph is
+    /// untouched — so the console can say which loop it refused.
+    public func cyclePath(ifBus id: UUID, wereRoutedTo parent: UUID?) -> [String]? {
+        var candidate = buses
+        guard let index = candidate.firstIndex(where: { $0.id == id }) else { return nil }
+        candidate[index].destinationBus = parent
+        do {
+            // Lanes are deliberately left out: they cannot take part in a bus
+            // loop, and an unrouted one would throw a different error.
+            _ = try RoutingGraph.build(lanes: [], buses: candidate)
+            return nil
+        } catch let RoutingError.cycle(path) {
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    /// UID prefix of the loopback devices Clapboard's own HAL driver
+    /// publishes: `com.astroqore.Clapboard.bus.<n>`, named `Clapboard Bus n`.
+    public static let virtualBusDeviceUIDPrefix = "com.astroqore.Clapboard.bus."
+
+    /// Output devices in the order a bus strip's picker lists them: Clapboard's
+    /// own virtual devices first when the driver is installed, everything else
+    /// after, each group keeping the registry's order (`docs/ROUTING.md`
+    /// § Virtual devices). Nothing in routing depends on this — `setBusOutput`
+    /// treats a `Clapboard Bus n` UID like any other — it is purely which one
+    /// the user's eye lands on first.
+    public static func busOutputDeviceOrder(_ devices: [AudioDeviceInfo]) -> [AudioDeviceInfo] {
+        let isVirtualBus = { (device: AudioDeviceInfo) in
+            device.uid.hasPrefix(virtualBusDeviceUIDPrefix)
+        }
+        return devices.filter(isVirtualBus) + devices.filter { !isVirtualBus($0) }
+    }
+
     // MARK: - Lane routing
 
     /// The bus this lane sums into. Rejected — silently, nothing mutated —
