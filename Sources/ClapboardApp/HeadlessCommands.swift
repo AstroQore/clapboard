@@ -12,7 +12,7 @@ enum HeadlessCommand {
         "--restore-session",
         "--session-dump",
         "--session-autosave-test",
-        "--hotkeys-selftest"
+        "--hotkeys-selftest",
         "--routing-selftest"
     ]
 
