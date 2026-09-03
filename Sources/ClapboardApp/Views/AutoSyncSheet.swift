@@ -25,6 +25,10 @@ struct AutoSyncSheet: View {
             footer
         }
         .frame(width: 760, height: 560)
+        // Open with nothing selected: the sheet's real action is its default
+        // button, and AppKit would otherwise ring whichever control happens to
+        // come first in the key-view loop.
+        .clapboardNoInitialFocus()
         .onAppear { session.refreshLanes() }
     }
 
