@@ -13,7 +13,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// sleep have to flush it explicitly.
     var session: SessionController?
 
+    /// Set by the scene. Carbon hotkeys are process-wide and have to be handed
+    /// back before the process goes away.
+    var hotkeys: HotkeyManager?
+
     private var observersInstalled = false
+    /// Owned here rather than by the scene: an `NSStatusItem` disappears when
+    /// its owner is released, and scene state does not outlive the window.
+    private let statusItemController = StatusItemController()
+
+    func installStatusItem(engine: AudioEngine, hotkeys: HotkeyManager) {
+        statusItemController.install(engine: engine, hotkeys: hotkeys)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -28,6 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// would keep every sub-device open.
     func applicationWillTerminate(_ notification: Notification) {
         session?.flush()
+        // Carbon hotkeys are registered against the window server, not against
+        // this object graph, so they are given back explicitly.
+        hotkeys?.shutdown()
+        statusItemController.remove()
         engine?.shutdown()
     }
 
