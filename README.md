@@ -348,7 +348,7 @@ window:
 ```sh
 BIN=.build/Clapboard.app/Contents/MacOS/Clapboard
 $BIN --list-devices
-$BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" --rebuild-at 8 --hot-lane "监听"
+$BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" --rebuild-at 8 --hot-lane "BlackHole 2ch"
 $BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane-effect AUPeakLimiter --lane "Audio Hijack Input" --master-effect AUDelay --bypass-at 10
 $BIN --effects-list
 $BIN --sync-test 8 --output Loopback --lane "Wireless Mic Rx" --lane "MacBook Pro Microphone" --apply   # clap when it says CLAP NOW
