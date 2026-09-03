@@ -28,6 +28,10 @@ struct OnboardingView: View {
             footer
         }
         .frame(width: 540, height: 460)
+        // Without this the sheet opens with a ring on Skip, because that is
+        // what sits first in the key-view loop — not on Continue, which is
+        // the default action and what Return already triggers.
+        .clapboardNoInitialFocus()
         .onAppear {
             permission.refresh()
             installer.refresh()
