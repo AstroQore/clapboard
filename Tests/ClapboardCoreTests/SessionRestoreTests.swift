@@ -34,8 +34,12 @@ struct SessionRestoreTests {
             return lane
         }
         #expect(snapshot.lanes == expectedLanes)
-        #expect(snapshot.outputDeviceUID == "the-output")
-        #expect(snapshot.masterGainDB == -6)
+        #expect(snapshot.formatVersion == 2)
+        // Format 2 carries the output device and the gain on the bus itself,
+        // not at the top level — that's what migration reads, not what a
+        // fresh save writes.
+        #expect(snapshot.buses.first?.outputDeviceUID == "the-output")
+        #expect(snapshot.buses.first?.gainDB == -6)
     }
 
     @Test func laneIdsAndOrderSurviveARestore() {

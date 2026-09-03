@@ -5,7 +5,7 @@ import Testing
 /// `AudioEngine`'s bus-routing API — `docs/ROUTING.md` — exercised on a
 /// stopped engine (no aggregate device is built, same convention
 /// `SessionRestoreTests` uses), so these run anywhere.
-private extension Result where Success == Void, Failure == AudioEngine.BusRoutingActionError {
+extension Result where Success == Void, Failure == AudioEngine.BusRoutingActionError {
     var isSuccess: Bool { if case .success = self { return true }; return false }
     var error: Failure? { if case .failure(let error) = self { return error }; return nil }
 }

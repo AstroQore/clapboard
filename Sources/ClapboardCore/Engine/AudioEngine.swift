@@ -51,7 +51,7 @@ public final class AudioEngine {
     /// The bus `setOutputDevice`/`masterGainDB`/`masterEffects`/`masterMeter`
     /// are thin shims onto. Fixed at creation and never removable, so those
     /// APIs — and the UI built on them — always have somewhere to point.
-    let masterBusID = UUID()
+    var masterBusID = UUID()
     /// The validated routing tree built from `lanes` and `buses`. Rebuilt by
     /// `rebuildRoutingGraph()` on every topology edit; a rebuild that would
     /// fail (an edit that was not pre-validated, or a hand-edited session)
@@ -156,13 +156,14 @@ public final class AudioEngine {
     private var sawFirstCallback = false
 
     public init() {
-        let master = BusConfig(id: masterBusID, name: BusConfig.masterName)
+        let master = BusConfig(name: BusConfig.masterName)
         buses = [master]
+        masterBusID = master.id
         // A single bus with no destination and no lanes cannot be a cycle or
         // point anywhere invalid, so this can never actually throw.
         graph = try! RoutingGraph.build(lanes: [], buses: [master])
         host.setMeterDecay(framesPerBlock: 256, sampleRate: 48_000)
-        host.runtime(forBus: masterBusID)
+        host.runtime(forBus: master.id)
         refreshAuthorization()
         TerminationGuard.register(self)
     }
@@ -676,7 +677,7 @@ public final class AudioEngine {
     /// gets `routingError` instead of a crash or a silently wrong mix. On
     /// failure the previous (still legal) graph is kept, so the render thread
     /// keeps running whatever it was last correctly told to.
-    private func rebuildRoutingGraph() {
+    func rebuildRoutingGraph() {
         do {
             graph = try RoutingGraph.build(lanes: lanes, buses: buses)
             routingError = nil
