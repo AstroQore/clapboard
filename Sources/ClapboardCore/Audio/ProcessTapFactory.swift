@@ -232,7 +232,7 @@ public enum ProcessTapFactory {
     /// Every tap UID this process has ever created, minus the ones it has
     /// destroyed. `leakedTapUIDs()` turns it into a real leak check against the
     /// HAL's own list rather than a bookkeeping claim.
-    private static let live = Mutex(Set<String>())
+    private static let live = LiveTapRegistry()
 
     /// Creates the tap `spec` describes.
     ///
@@ -271,7 +271,7 @@ public enum ProcessTapFactory {
                 .init(kAudioTapPropertyFormat), as: AudioStreamBasicDescription.self)
             guard format.mChannelsPerFrame > 0 else { throw ProcessTapError.noFormat(status: noErr) }
             created = true
-            live.withLock { _ = $0.insert(uid) }
+            live.insert(uid)
             return ProcessTap(
                 objectID: tapID, uid: uid, spec: spec,
                 format: format, processObjectIDs: processObjectIDs)
@@ -330,7 +330,7 @@ public enum ProcessTapFactory {
     /// UIDs this process created and never destroyed that the HAL still lists.
     /// Empty is the only acceptable answer after a clean shutdown.
     public static func leakedTapUIDs() -> [String] {
-        let ours = live.withLock { $0 }
+        let ours = live.snapshot()
         guard !ours.isEmpty else { return [] }
         let ids = (try? AudioObjectID.system.propertyArray(
             .init(kAudioHardwarePropertyTapList), of: AudioObjectID.self)) ?? []
@@ -339,10 +339,10 @@ public enum ProcessTapFactory {
     }
 
     /// Tap UIDs this process believes it still owns, leaked or not.
-    public static func liveTapUIDs() -> [String] { live.withLock { $0 }.sorted() }
+    public static func liveTapUIDs() -> [String] { live.snapshot().sorted() }
 
     static func forget(uid: String) {
-        live.withLock { _ = $0.remove(uid) }
+        live.remove(uid)
     }
 
     /// macOS reports a missing system-audio-capture authorization as a plain
@@ -358,18 +358,28 @@ public enum ProcessTapFactory {
     }
 }
 
-/// Tiny lock, so `ProcessTapFactory`'s bookkeeping can be touched from any
-/// thread without importing `Synchronization` into a type that also has to be
-/// usable from Swift 5 mode call sites.
-final class Mutex<Value>: @unchecked Sendable {
-    private var value: Value
+/// The set of tap UIDs this process owns.
+///
+/// `ProcessTap.destroy()` can run from `deinit` on any thread, so this is
+/// locked. Deliberately *not* named `Mutex`: `Synchronization.Mutex` exists and
+/// the real-time files import that module, and a same-module type that shadows
+/// it would be a trap waiting for whoever reaches for it there next.
+private final class LiveTapRegistry: @unchecked Sendable {
+    private var uids: Set<String> = []
     private let lock = NSLock()
 
-    init(_ value: Value) { self.value = value }
+    func insert(_ uid: String) {
+        lock.lock(); defer { lock.unlock() }
+        uids.insert(uid)
+    }
 
-    func withLock<Result>(_ body: (inout Value) -> Result) -> Result {
-        lock.lock()
-        defer { lock.unlock() }
-        return body(&value)
+    func remove(_ uid: String) {
+        lock.lock(); defer { lock.unlock() }
+        uids.remove(uid)
+    }
+
+    func snapshot() -> Set<String> {
+        lock.lock(); defer { lock.unlock() }
+        return uids
     }
 }
