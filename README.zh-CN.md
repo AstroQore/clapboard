@@ -90,7 +90,7 @@ Clapboard --restore-session /tmp/session.json --run 5
 ```sh
 BIN=.build/Clapboard.app/Contents/MacOS/Clapboard
 $BIN --list-devices
-$BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" --rebuild-at 8 --hot-lane "监听"
+$BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" --rebuild-at 8 --hot-lane "BlackHole 2ch"
 $BIN --sync-test 8 --output Loopback --lane "Wireless Mic Rx" --lane "MacBook Pro Microphone" --apply   # 提示 CLAP NOW 时拍一下手
 $BIN --engine-test 5 --output Loopback --lane "MacBook Pro Microphone" --save-session --session-path /tmp/s.json
 $BIN --restore-session /tmp/s.json --run 3
