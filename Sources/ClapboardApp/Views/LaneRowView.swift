@@ -25,6 +25,7 @@ struct LaneRowView: View {
         VStack(alignment: .leading, spacing: 6) {
             header
             controls
+            EffectChainView(engine: engine, laneID: lane.id)
         }
         .padding(10)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
@@ -155,7 +156,8 @@ struct LaneRowView: View {
                 .frame(width: 52, alignment: .leading)
                 .help(delayIsStale
                       ? "The aggregate device was rebuilt after this delay was measured — run Auto Sync again"
-                      : "Delay in whole samples at 48 kHz")
+                      : "Delay in whole samples at 48 kHz. Plug-in delay compensation is "
+                        + "added on top; the chain row shows how much.")
         }
     }
 }

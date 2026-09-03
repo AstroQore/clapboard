@@ -56,10 +56,32 @@ public final class AudioEngine {
     public private(set) var restartCount = 0
     public private(set) var aggregateSummary: String?
     public private(set) var laneStatus: [UUID: LaneStatus] = [:]
+    /// Per-lane effect chains, keyed by `LaneConfig.id`. An entry whose
+    /// `unavailableReason` is set is a placeholder: it holds a plug-in's saved
+    /// state so a session opened without that plug-in can be saved again
+    /// without losing it, and it is not published to the render thread.
+    public internal(set) var laneEffects: [UUID: [EffectConfig]] = [:]
+    /// The master bus chain, after the sum and before the master fader.
+    public internal(set) var masterEffects: [EffectConfig] = []
+    /// Extra delay plug-in delay compensation is adding to each lane, in
+    /// samples. Purely derived; the UI shows it next to the manual delay.
+    public internal(set) var pdcSamples: [UUID: Int] = [:]
+    /// Set when a lane's compensated delay had to be clamped to
+    /// `RTLimits.maxDelaySamples`, which means the mix is no longer aligned.
+    public internal(set) var pdcWarning: String?
+    /// True while a restored session's chains are still being instantiated.
+    public internal(set) var restoringEffects = false
     public var masterGainDB: Float = 0 {
         didSet { host.setMasterGain(linear: Decibels.linear(masterGainDB)) }
     }
     public private(set) var microphoneAuthorized = false
+
+    /// Opening and closing a plug-in's editor window is AppKit work, and
+    /// `ClapboardCore` has no AppKit. The app wires these to
+    /// `AUPluginWindowController`; `onCloseEffectWindow` is called before an
+    /// instance is torn down, because the window holds the plug-in's view.
+    public var onShowEffectWindow: ((AUEffectInstance) -> Void)?
+    public var onCloseEffectWindow: ((AUEffectInstance) -> Void)?
 
     /// Diagnostics only. Lets the engine run without microphone TCC so the
     /// aggregate device, IOProc cadence and output path can be exercised on a
@@ -73,7 +95,10 @@ public final class AudioEngine {
 
     // MARK: - Private
 
-    private let host = RTEngineHost()
+    let host = RTEngineHost()
+    /// Restoring a session's chains means instantiating plug-ins, which is
+    /// `async`; the task is kept so a second restore cannot race the first.
+    var effectRestoreTask: Task<Void, Never>?
     private var aggregate: AggregateDevice?
     private var ioProc: HALIOProc?
     private var watchdog: Timer?
@@ -126,6 +151,7 @@ public final class AudioEngine {
         host.runtime(for: lane.id)
         pushParameters(lane)
         applyTopologyChange()
+        pushEffectiveDelays()
         return lane
     }
 
@@ -133,10 +159,18 @@ public final class AudioEngine {
         guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
         lanes.remove(at: index)
         laneStatus[id] = nil
+        pdcSamples[id] = nil
+        // The lane's plug-ins go the same way its runtime does: detached now,
+        // freed once the render thread has left the snapshot that named them.
+        for effect in laneEffects.removeValue(forKey: id) ?? [] {
+            host.discardEffect(id: effect.id)
+        }
         // The runtime is only detached here; `RTEngineHost` frees it once the
         // render thread has moved past the snapshot that referenced it.
         host.discardRuntime(for: id)
         applyTopologyChange()
+        pushEffectiveDelays()
+        drainRetiredEffects()
     }
 
     /// Lane order is cosmetic — the mix is a plain sum — but it is also the
@@ -175,10 +209,13 @@ public final class AudioEngine {
         host.setLanePolarity(id, inverted: inverted)
     }
 
+    /// The manual — or Auto Sync measured — delay. What actually reaches the
+    /// render thread is this plus plug-in delay compensation; see
+    /// `pushEffectiveDelays()`.
     public func setLaneDelaySamples(_ id: UUID, _ samples: Int) {
         let clamped = max(0, min(RTLimits.maxDelaySamples, samples))
         mutate(id) { $0.delaySamples = clamped }
-        host.setLaneDelay(id, samples: clamped)
+        pushEffectiveDelays()
     }
 
     public func setLaneName(_ id: UUID, _ name: String) {
@@ -208,16 +245,18 @@ public final class AudioEngine {
         delaysMayBeStale = false
     }
 
-    private func mutate(_ id: UUID, _ body: (inout LaneConfig) -> Void) {
+    func mutate(_ id: UUID, _ body: (inout LaneConfig) -> Void) {
         guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
         body(&lanes[index])
     }
 
+    /// Delay is deliberately absent: it is the one parameter the host does not
+    /// take at face value, because plug-in delay compensation is added to it.
+    /// `pushEffectiveDelays()` owns it.
     private func pushParameters(_ lane: LaneConfig) {
         host.setLaneGain(lane.id, linear: Decibels.linear(lane.gainDB))
         host.setLaneEnabled(lane.id, lane.enabled)
         host.setLanePolarity(lane.id, inverted: lane.polarityInverted)
-        host.setLaneDelay(lane.id, samples: lane.delaySamples)
     }
 
     // MARK: - Auto Sync capture
@@ -380,9 +419,16 @@ public final class AudioEngine {
     }
 
     /// Called from `applicationWillTerminate`.
+    ///
+    /// Plug-ins are torn down here rather than in `stop()`: a chain has to
+    /// survive stop/start and every aggregate rebuild, because reloading a
+    /// plug-in would drop its state and its editor window. By the time this
+    /// runs the IOProc has stopped, so no render thread can be inside
+    /// `AUEffectInstance.process`.
     public func shutdown() {
         tearDown()
         runState = .stopped
+        teardownAllEffects()
     }
 
     // MARK: - System events
@@ -471,6 +517,12 @@ public final class AudioEngine {
             pushParameters(lane)
         }
         host.setMasterGain(linear: Decibels.linear(masterGainDB))
+        // Chains survive a stop/start and every aggregate rebuild — reloading
+        // a plug-in would drop its state and its editor window — but their
+        // tails do not: a 20-second delay must not keep ringing across the
+        // gap. Safe here because the IOProc has not been started yet.
+        for instance in host.allEffectInstances() { instance.reset() }
+        pushEffectiveDelays()
         republishGraph()
 
         // `align()` may have moved a sub-device to 48 kHz; re-read so the
@@ -579,7 +631,7 @@ public final class AudioEngine {
         registry?.devices ?? ((try? AudioDeviceInfo.enumerateAll()) ?? [])
     }
 
-    private func republishGraph() {
+    func republishGraph() {
         guard let aggregate else {
             host.unpublish()
             laneStatus = lanes.reduce(into: [:]) { $0[$1.id] = .idle }
@@ -637,8 +689,17 @@ public final class AudioEngine {
             nodes: nodes,
             outputBufferIndex: aggregate.masterOutputBufferIndex,
             outputChannelsInBuffer: aggregate.masterOutputChannels,
-            outputChannelOffset: 0
+            outputChannelOffset: 0,
+            laneEffectIDs: lanes.map { publishableEffectIDs(laneEffects[$0.id]) },
+            masterEffectIDs: publishableEffectIDs(masterEffects)
         )
+    }
+
+    /// Placeholders — a plug-in that is not installed, or one macOS refused to
+    /// load — have no instance and are simply not in the chain the render
+    /// thread sees. The mix runs without them rather than stopping.
+    private func publishableEffectIDs(_ chain: [EffectConfig]?) -> [UUID] {
+        (chain ?? []).filter { $0.isAvailable }.map(\.id)
     }
 
     // MARK: - Watchdog
@@ -654,6 +715,7 @@ public final class AudioEngine {
 
     private func tickWatchdog() {
         host.collectGarbage()
+        drainRetiredEffects()
         overloadCount = host.overloadCount
         guard runState.isRunning else { return }
         let hostTime = host.lastCallbackHostTime

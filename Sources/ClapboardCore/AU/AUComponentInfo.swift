@@ -30,6 +30,11 @@ public struct AUComponentInfo: Identifiable, Hashable, Codable, Sendable {
     /// Category tags as the component manager reports them ("Effects",
     /// "Reverb"…). Empty for most third-party plug-ins.
     public var tags: [String]
+    /// Where the component lives, when the component manager knows. Used to
+    /// read the executable's Mach-O header — see `AUAvailability` — and never
+    /// as an identity: a plug-in that moves is still the same plug-in, which
+    /// is why `id` is built from the four-char codes instead.
+    public var bundleURL: URL?
 
     public init(
         name: String,
@@ -42,7 +47,8 @@ public struct AUComponentInfo: Identifiable, Hashable, Codable, Sendable {
         componentFlagsMask: UInt32 = 0,
         hasCustomView: Bool = false,
         isSandboxSafe: Bool = false,
-        tags: [String] = []
+        tags: [String] = [],
+        bundleURL: URL? = nil
     ) {
         self.name = name
         self.manufacturerName = manufacturerName
@@ -55,6 +61,7 @@ public struct AUComponentInfo: Identifiable, Hashable, Codable, Sendable {
         self.hasCustomView = hasCustomView
         self.isSandboxSafe = isSandboxSafe
         self.tags = tags
+        self.bundleURL = bundleURL
     }
 
     /// Stable across launches and across versions of the same plug-in, which

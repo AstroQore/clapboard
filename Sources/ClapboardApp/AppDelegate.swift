@@ -27,7 +27,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Last chance to destroy the private aggregate device. Leaving one behind
     /// would keep every sub-device open.
     func applicationWillTerminate(_ notification: Notification) {
+        // The session is written first: `shutdown()` tears the plug-ins down,
+        // and a torn-down plug-in has no state left to save.
         session?.flush()
+        AUPluginWindowController.shared.closeAll()
         engine?.shutdown()
     }
 

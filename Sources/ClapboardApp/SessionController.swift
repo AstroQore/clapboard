@@ -34,7 +34,9 @@ final class SessionController {
     @ObservationIgnored private var isRestoring = false
     @ObservationIgnored private var isDirty = false
     /// State a newer Clapboard wrote that this one does not model. Carried
-    /// from load to save untouched so an older build cannot erase it.
+    /// from load to save untouched so an older build cannot erase it. The
+    /// effect-chain key is excluded: this build owns it, and carrying it would
+    /// resurrect a chain the user has just deleted.
     @ObservationIgnored private var carriedLaneExtras: [String: [String: Data]] = [:]
     @ObservationIgnored private var carriedMasterExtras: [String: Data] = [:]
 
@@ -104,11 +106,21 @@ final class SessionController {
         pendingSave?.cancel()
         pendingSave = nil
         guard let store, let engine else { return }
+        // The snapshot already carries this build's effect chains; everything
+        // else a newer Clapboard left in the bags is merged back in, minus
+        // extras belonging to lanes that no longer exist.
         var document = engine.sessionSnapshot
-        // Extras belonging to lanes that no longer exist go with them.
         let ids = Set(engine.lanes.map(\.id.uuidString))
-        document.laneExtras = carriedLaneExtras.filter { ids.contains($0.key) }
-        document.masterExtras = carriedMasterExtras
+        for (laneID, bag) in carriedLaneExtras where ids.contains(laneID) {
+            for (key, value) in bag
+            where key != EffectChainCodec.extrasKey && document.laneExtras[laneID]?[key] == nil {
+                document.laneExtras[laneID, default: [:]][key] = value
+            }
+        }
+        for (key, value) in carriedMasterExtras
+        where key != EffectChainCodec.extrasKey && document.masterExtras[key] == nil {
+            document.masterExtras[key] = value
+        }
         do {
             try store.save(document)
             isDirty = false
@@ -130,6 +142,12 @@ final class SessionController {
             _ = engine.lanes
             _ = engine.outputDeviceUID
             _ = engine.masterGainDB
+            // Chain edits are session changes too. A plug-in's *parameters*
+            // are not observable — nothing here can see a knob move inside a
+            // plug-in's own window — so those are picked up by the save on
+            // quit and by the next edit that does fire.
+            _ = engine.laneEffects
+            _ = engine.masterEffects
         } onChange: { [weak self] in
             // `onChange` fires *before* the value lands, and re-arming from
             // inside it would observe the old state; hop to the next main-actor

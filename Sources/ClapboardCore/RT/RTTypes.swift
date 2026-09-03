@@ -19,8 +19,13 @@ public enum RTLimits {
     @inline(__always) public static var delayCapacity: Int { 48_000 + 8192 }
     /// Channels a lane can carry (mono uses channel 0 only).
     @inline(__always) public static var laneChannels: Int { 2 }
-    /// Crossfade length when a delay changes: ~10 ms at 48 kHz.
+    /// Crossfade length when a delay changes: ~10 ms at 48 kHz. The same
+    /// length is used when an effect's bypass flips.
     @inline(__always) public static var crossfadeFrames: Int { 480 }
+    /// Effects one lane — or the master bus — may carry. A cap exists only so
+    /// the host can reject a pathological chain before it reaches the render
+    /// thread; nothing in the kernel iterates a fixed number of slots.
+    @inline(__always) public static var maxEffectsPerChain: Int { 16 }
 }
 
 /// A peak/RMS pair as the UI sees it. Linear amplitude, not dB.
@@ -106,6 +111,58 @@ public struct LaneRuntime: ~Copyable {
     }
 }
 
+/// Everything one hosted effect must remember between blocks.
+///
+/// Allocated once per effect id by `RTEngineHost` and — like `LaneRuntime` —
+/// **kept across graph rebuilds**, because the graph snapshot's slot array is
+/// rebuilt from scratch on every publish. Putting the bypass crossfade in the
+/// slot would therefore restart it every time an unrelated lane is added,
+/// which is exactly the click the crossfade exists to prevent.
+public struct EffectRuntime: ~Copyable {
+    /// The bypass the user asked for.
+    ///
+    /// Deliberately *not* `AUEffectInstance.bypass`: that flag makes `process`
+    /// return before it touches the plug-in, so a host that flipped it
+    /// directly would have no wet signal left to crossfade against and the
+    /// switch would step. The kernel reads this flag, crossfades towards it,
+    /// and only then writes the settled value through to the instance.
+    public let bypassRequested = Atomic<Bool>(false)
+
+    /// 0 = the dry lane, 1 = the plug-in's output. Render-thread owned.
+    var bypassMix: Float = 1
+    /// False until the first block, which snaps the mix to its target instead
+    /// of fading in from wherever the previous engine run left it.
+    var primed: Bool = false
+
+    public init() {}
+}
+
+/// One effect in a chain, as the render thread sees it.
+///
+/// `Unmanaged` rather than a strong reference: the render thread must not
+/// touch a retain count. `RTEngineHost` holds the only strong reference and
+/// keeps it until a snapshot that could reach this slot has been reclaimed —
+/// the same rule that governs `LaneRuntime`.
+public struct RTEffectSlot {
+    public var instance: Unmanaged<AUEffectInstance>
+    public var runtime: UnsafeMutablePointer<EffectRuntime>
+    /// Lane channels the instance was configured for, cached so the render
+    /// thread does not have to load it out of the class. 1 or 2; a mono lane
+    /// running dual-mono through a stereo plug-in still reads 1, because
+    /// `AUEffectInstance.process` does the doubling itself.
+    public var channels: Int
+
+    public init(
+        instance: Unmanaged<AUEffectInstance>,
+        runtime: UnsafeMutablePointer<EffectRuntime>,
+        channels: Int
+    ) {
+        self.instance = instance
+        self.runtime = runtime
+        self.channels = channels
+    }
+}
+
 /// One lane as the render thread sees it: where its samples come from and
 /// which persistent state block to use.
 ///
@@ -123,6 +180,10 @@ public struct RTLaneNode {
     public var bufferIndex1: Int
     public var channelInBuffer1: Int
     public var channelsInBuffer1: Int
+    /// The lane's effect chain, in order, pointing into the snapshot's flat
+    /// slot storage. `nil` when the lane carries no effects.
+    public var effects: UnsafeMutablePointer<RTEffectSlot>?
+    public var effectCount: Int
 
     public init(
         runtime: UnsafeMutablePointer<LaneRuntime>,
@@ -132,7 +193,9 @@ public struct RTLaneNode {
         channelsInBuffer0: Int,
         bufferIndex1: Int = -1,
         channelInBuffer1: Int = 0,
-        channelsInBuffer1: Int = 0
+        channelsInBuffer1: Int = 0,
+        effects: UnsafeMutablePointer<RTEffectSlot>? = nil,
+        effectCount: Int = 0
     ) {
         self.runtime = runtime
         self.channelCount = channelCount
@@ -142,6 +205,8 @@ public struct RTLaneNode {
         self.bufferIndex1 = bufferIndex1
         self.channelInBuffer1 = channelInBuffer1
         self.channelsInBuffer1 = channelsInBuffer1
+        self.effects = effects
+        self.effectCount = effectCount
     }
 }
 
@@ -159,13 +224,25 @@ public struct RTGraph {
     /// First master channel inside that buffer (0 for a plain stereo stream).
     public var outputChannelOffset: Int
 
+    /// Flat storage for every slot in the snapshot: each lane's chain in lane
+    /// order, then the master chain. One allocation, freed with the graph;
+    /// `RTLaneNode.effects` and `masterEffects` point into it.
+    public var effectSlots: UnsafeMutablePointer<RTEffectSlot>?
+    public var effectSlotCount: Int
+    public var masterEffects: UnsafeMutablePointer<RTEffectSlot>?
+    public var masterEffectCount: Int
+
     public init(
         generation: UInt64,
         laneCount: Int,
         lanes: UnsafeMutablePointer<RTLaneNode>?,
         outputBufferIndex: Int,
         outputChannelsInBuffer: Int,
-        outputChannelOffset: Int = 0
+        outputChannelOffset: Int = 0,
+        effectSlots: UnsafeMutablePointer<RTEffectSlot>? = nil,
+        effectSlotCount: Int = 0,
+        masterEffects: UnsafeMutablePointer<RTEffectSlot>? = nil,
+        masterEffectCount: Int = 0
     ) {
         self.generation = generation
         self.laneCount = laneCount
@@ -173,6 +250,10 @@ public struct RTGraph {
         self.outputBufferIndex = outputBufferIndex
         self.outputChannelsInBuffer = outputChannelsInBuffer
         self.outputChannelOffset = outputChannelOffset
+        self.effectSlots = effectSlots
+        self.effectSlotCount = effectSlotCount
+        self.masterEffects = masterEffects
+        self.masterEffectCount = masterEffectCount
     }
 }
 
@@ -219,6 +300,16 @@ public struct RTState: ~Copyable {
     /// Per-lane scratch, `maxFramesPerBlock` floats each.
     var laneLeft: UnsafeMutablePointer<Float>
     var laneRight: UnsafeMutablePointer<Float>
+    /// Dry copies taken while an effect's bypass is crossfading. Effects run
+    /// strictly one at a time — lane chains in lane order, then the master
+    /// chain — so one pair of buffers serves every slot in the graph.
+    var fxDryLeft: UnsafeMutablePointer<Float>
+    var fxDryRight: UnsafeMutablePointer<Float>
+
+    /// Frames rendered since the engine started, handed to every plug-in as
+    /// its block's sample time. Tempo-synced and modulating plug-ins need it
+    /// to advance monotonically; only the render thread touches it.
+    var sampleTime: Int64 = 0
 
     var masterSmoothedGain: Float = 1
     var masterPrimed: Bool = false
@@ -232,12 +323,16 @@ public struct RTState: ~Copyable {
         mixLeft: UnsafeMutablePointer<Float>,
         mixRight: UnsafeMutablePointer<Float>,
         laneLeft: UnsafeMutablePointer<Float>,
-        laneRight: UnsafeMutablePointer<Float>
+        laneRight: UnsafeMutablePointer<Float>,
+        fxDryLeft: UnsafeMutablePointer<Float>,
+        fxDryRight: UnsafeMutablePointer<Float>
     ) {
         self.mixLeft = mixLeft
         self.mixRight = mixRight
         self.laneLeft = laneLeft
         self.laneRight = laneRight
+        self.fxDryLeft = fxDryLeft
+        self.fxDryRight = fxDryRight
     }
 }
 
@@ -257,7 +352,9 @@ public enum RTMemory {
             mixLeft: makeSilentBuffer(count: frames),
             mixRight: makeSilentBuffer(count: frames),
             laneLeft: makeSilentBuffer(count: frames),
-            laneRight: makeSilentBuffer(count: frames)
+            laneRight: makeSilentBuffer(count: frames),
+            fxDryLeft: makeSilentBuffer(count: frames),
+            fxDryRight: makeSilentBuffer(count: frames)
         ))
         return state
     }
@@ -267,8 +364,21 @@ public enum RTMemory {
         state.pointee.mixRight.deallocate()
         state.pointee.laneLeft.deallocate()
         state.pointee.laneRight.deallocate()
+        state.pointee.fxDryLeft.deallocate()
+        state.pointee.fxDryRight.deallocate()
         state.deinitialize(count: 1)
         state.deallocate()
+    }
+
+    public static func makeEffectRuntime() -> UnsafeMutablePointer<EffectRuntime> {
+        let runtime = UnsafeMutablePointer<EffectRuntime>.allocate(capacity: 1)
+        runtime.initialize(to: EffectRuntime())
+        return runtime
+    }
+
+    public static func destroyEffectRuntime(_ runtime: UnsafeMutablePointer<EffectRuntime>) {
+        runtime.deinitialize(count: 1)
+        runtime.deallocate()
     }
 
     public static func makeLaneRuntime() -> UnsafeMutablePointer<LaneRuntime> {
@@ -289,12 +399,34 @@ public enum RTMemory {
         runtime.deallocate()
     }
 
+    /// Allocates the snapshot's flat effect-slot storage, or `nil` when the
+    /// graph carries no effects at all.
+    public static func makeEffectSlots(_ slots: [RTEffectSlot]) -> UnsafeMutablePointer<RTEffectSlot>? {
+        guard !slots.isEmpty else { return nil }
+        let buffer = UnsafeMutablePointer<RTEffectSlot>.allocate(capacity: slots.count)
+        for (index, slot) in slots.enumerated() {
+            buffer.advanced(by: index).initialize(to: slot)
+        }
+        return buffer
+    }
+
+    /// - Parameters:
+    ///   - nodes: lane nodes whose `effects` pointers already point into
+    ///     `effectSlots`. `RTEngineHost` does that patching, because it is the
+    ///     only place that knows which chain belongs to which lane.
+    ///   - effectSlots: flat slot storage from `makeEffectSlots`, owned by the
+    ///     graph from here on.
+    ///   - masterEffectOffset: where the master chain starts inside it.
     public static func makeGraph(
         generation: UInt64,
         nodes: [RTLaneNode],
         outputBufferIndex: Int,
         outputChannelsInBuffer: Int,
-        outputChannelOffset: Int
+        outputChannelOffset: Int,
+        effectSlots: UnsafeMutablePointer<RTEffectSlot>? = nil,
+        effectSlotCount: Int = 0,
+        masterEffectOffset: Int = 0,
+        masterEffectCount: Int = 0
     ) -> (graph: UnsafeMutablePointer<RTGraph>, lanes: UnsafeMutablePointer<RTLaneNode>?) {
         var lanes: UnsafeMutablePointer<RTLaneNode>?
         if !nodes.isEmpty {
@@ -311,7 +443,11 @@ public enum RTMemory {
             lanes: lanes,
             outputBufferIndex: outputBufferIndex,
             outputChannelsInBuffer: outputChannelsInBuffer,
-            outputChannelOffset: outputChannelOffset
+            outputChannelOffset: outputChannelOffset,
+            effectSlots: effectSlots,
+            effectSlotCount: effectSlotCount,
+            masterEffects: masterEffectCount > 0 ? effectSlots?.advanced(by: masterEffectOffset) : nil,
+            masterEffectCount: masterEffectCount
         ))
         return (graph, lanes)
     }
@@ -324,6 +460,14 @@ public enum RTMemory {
         if let lanes, laneCount > 0 {
             lanes.deinitialize(count: laneCount)
             lanes.deallocate()
+        }
+        // The slots themselves are trivial — an `Unmanaged` and two integers —
+        // so freeing them releases nothing. The strong references live in
+        // `RTEngineHost`, which is what keeps the plug-ins alive until every
+        // snapshot that could reach them has been reclaimed.
+        if let slots = graph.pointee.effectSlots, graph.pointee.effectSlotCount > 0 {
+            slots.deinitialize(count: graph.pointee.effectSlotCount)
+            slots.deallocate()
         }
         graph.deinitialize(count: 1)
         graph.deallocate()

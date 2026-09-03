@@ -204,6 +204,8 @@ struct MixerView: View {
                 MeterReadout(isLive: engine.runState.isRunning) { engine.masterMeter }
             }
 
+            EffectChainView(engine: engine, laneID: nil)
+
             HStack(spacing: 10) {
                 Label(
                     String(format: "sync spread %.1f ms", spreadMilliseconds),
@@ -212,6 +214,17 @@ struct MixerView: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .help("Largest lane delay currently written into the mix")
+
+                Label(
+                    String(format: "output latency %.1f ms", engine.outputLatencyMilliseconds),
+                    systemImage: "clock.arrow.circlepath"
+                )
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(engine.outputLatencySamples > 0
+                                 ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
+                .help("\(engine.outputLatencySamples) samples: the slowest lane's plug-in chain, "
+                      + "which every other lane is delayed to match, plus the master chain — "
+                      + "common to all lanes, so it is reported rather than compensated.")
 
                 if engine.delaysMayBeStale {
                     // Drift compensation puts a resampler in front of every
@@ -233,6 +246,13 @@ struct MixerView: View {
                         .font(.caption)
                 }
                 Spacer()
+            }
+
+            if let warning = engine.pdcWarning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if let error = engine.lastError {

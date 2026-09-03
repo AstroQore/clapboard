@@ -19,6 +19,19 @@ public final class RTEngineHost {
         /// Lane runtimes whose lanes were removed in the publish that retired
         /// this snapshot. They can only be freed with it.
         let laneRuntimes: [UnsafeMutablePointer<LaneRuntime>]
+        /// Effects removed in the same publish. Same rule, one level up: the
+        /// plug-in stays alive until the render thread has provably left every
+        /// snapshot that could reach its slot.
+        let effects: [EffectEntry]
+    }
+
+    /// One hosted plug-in as the host owns it: the only strong reference to
+    /// the instance, plus the persistent per-effect state the slots point at.
+    private struct EffectEntry {
+        let id: UUID
+        let instance: AUEffectInstance
+        let runtime: UnsafeMutablePointer<EffectRuntime>
+        let channels: Int
     }
 
     /// The single value an IOProc block may capture.
@@ -33,6 +46,12 @@ public final class RTEngineHost {
     private var nextGeneration: UInt64 = 1
     /// Lanes that currently own an Auto Sync capture buffer.
     private var captureLaneIDs: [UUID] = []
+    private var effects: [UUID: EffectEntry] = [:]
+    private var pendingEffectFrees: [EffectEntry] = []
+    /// Plug-ins whose last snapshot has been reclaimed. The owner drains this
+    /// on the main actor and calls `teardown()`; nothing here can, because
+    /// teardown talks to the plug-in and this class has no actor.
+    private var reclaimedEffects: [AUEffectInstance] = []
 
     public init() {
         state = RTMemory.makeState()
@@ -45,6 +64,7 @@ public final class RTEngineHost {
         for entry in retired {
             RTMemory.destroyGraph(entry.graph, lanes: entry.lanes, laneCount: entry.laneCount)
             for runtime in entry.laneRuntimes { RTMemory.destroyLaneRuntime(runtime) }
+            for effect in entry.effects { RTMemory.destroyEffectRuntime(effect.runtime) }
         }
         retired.removeAll()
         if let liveGraph {
@@ -52,9 +72,63 @@ public final class RTEngineHost {
         }
         for runtime in pendingRuntimeFrees { RTMemory.destroyLaneRuntime(runtime) }
         for runtime in laneRuntimes.values { RTMemory.destroyLaneRuntime(runtime) }
+        for effect in pendingEffectFrees { RTMemory.destroyEffectRuntime(effect.runtime) }
+        for effect in effects.values { RTMemory.destroyEffectRuntime(effect.runtime) }
+        effects.removeAll()
         captureLaneIDs.removeAll()
         RTMemory.destroyState(state)
     }
+
+    // MARK: - Effects
+
+    /// Takes ownership of a hosted plug-in. The instance is not published to
+    /// the render thread until a `publish` names its id in a chain.
+    public func registerEffect(id: UUID, instance: AUEffectInstance, channels: Int) {
+        guard effects[id] == nil else { return }
+        effects[id] = EffectEntry(
+            id: id,
+            instance: instance,
+            runtime: RTMemory.makeEffectRuntime(),
+            channels: max(1, min(2, channels))
+        )
+    }
+
+    /// Detaches a plug-in. Like `discardRuntime(for:)` it frees nothing: the
+    /// entry is handed to the next retired snapshot and only becomes
+    /// reclaimable once the render thread has moved past it.
+    public func discardEffect(id: UUID) {
+        guard let entry = effects.removeValue(forKey: id) else { return }
+        pendingEffectFrees.append(entry)
+    }
+
+    public func hasEffect(id: UUID) -> Bool { effects[id] != nil }
+
+    public func effectInstance(id: UUID) -> AUEffectInstance? { effects[id]?.instance }
+
+    /// The bypass the kernel crossfades towards. Never writes
+    /// `AUEffectInstance.bypass` directly — see `EffectRuntime`.
+    public func setEffectBypass(id: UUID, _ bypassed: Bool) {
+        effects[id]?.runtime.pointee.bypassRequested.store(bypassed, ordering: .relaxed)
+    }
+
+    public func effectBypass(id: UUID) -> Bool {
+        effects[id]?.runtime.pointee.bypassRequested.load(ordering: .relaxed) ?? false
+    }
+
+    /// Plug-ins the render thread can no longer reach. Drain on the main
+    /// actor and `teardown()` each one.
+    public func takeRetiredEffects() -> [AUEffectInstance] {
+        defer { reclaimedEffects.removeAll(keepingCapacity: true) }
+        return reclaimedEffects
+    }
+
+    /// Every plug-in still owned by the host, for a shutdown that has to tear
+    /// them all down after the IOProc stopped.
+    public func allEffectInstances() -> [AUEffectInstance] {
+        effects.values.map(\.instance)
+    }
+
+    public var registeredEffectCount: Int { effects.count }
 
     // MARK: - Lane runtimes
 
@@ -259,20 +333,67 @@ public final class RTEngineHost {
     // MARK: - Graph publication
 
     /// Publishes a new topology. The previous snapshot is retired, not freed.
+    ///
+    /// - Parameters:
+    ///   - laneEffectIDs: each lane's chain, in order, parallel to `nodes`.
+    ///     Ids the host does not know are skipped rather than refused, so a
+    ///     chain edit racing a republish cannot publish a dangling slot.
+    ///   - masterEffectIDs: the master bus chain.
     public func publish(
         nodes: [RTLaneNode],
         outputBufferIndex: Int,
         outputChannelsInBuffer: Int,
-        outputChannelOffset: Int = 0
+        outputChannelOffset: Int = 0,
+        laneEffectIDs: [[UUID]] = [],
+        masterEffectIDs: [UUID] = []
     ) {
         let generation = nextGeneration
         nextGeneration += 1
+
+        // One flat allocation for every slot in the snapshot: each lane's
+        // chain in lane order, then the master chain. The ranges are recorded
+        // first because the pointers only exist once the buffer does.
+        var slots: [RTEffectSlot] = []
+        var laneRanges = [(offset: Int, count: Int)](repeating: (0, 0), count: nodes.count)
+        for index in nodes.indices {
+            let ids = index < laneEffectIDs.count ? laneEffectIDs[index] : []
+            let offset = slots.count
+            for id in ids.prefix(RTLimits.maxEffectsPerChain) {
+                guard let entry = effects[id] else { continue }
+                slots.append(makeSlot(entry))
+            }
+            laneRanges[index] = (offset, slots.count - offset)
+        }
+        let masterOffset = slots.count
+        for id in masterEffectIDs.prefix(RTLimits.maxEffectsPerChain) {
+            guard let entry = effects[id] else { continue }
+            slots.append(makeSlot(entry))
+        }
+        let masterCount = slots.count - masterOffset
+        let storage = RTMemory.makeEffectSlots(slots)
+
+        var patched = nodes
+        for index in patched.indices {
+            let range = laneRanges[index]
+            if range.count > 0, let storage {
+                patched[index].effects = storage.advanced(by: range.offset)
+                patched[index].effectCount = range.count
+            } else {
+                patched[index].effects = nil
+                patched[index].effectCount = 0
+            }
+        }
+
         let made = RTMemory.makeGraph(
             generation: generation,
-            nodes: nodes,
+            nodes: patched,
             outputBufferIndex: outputBufferIndex,
             outputChannelsInBuffer: outputChannelsInBuffer,
-            outputChannelOffset: outputChannelOffset
+            outputChannelOffset: outputChannelOffset,
+            effectSlots: storage,
+            effectSlotCount: slots.count,
+            masterEffectOffset: masterOffset,
+            masterEffectCount: masterCount
         )
         let previousGraph = liveGraph
         let previousLanes = liveLanes
@@ -286,20 +407,39 @@ public final class RTEngineHost {
 
         let freeing = pendingRuntimeFrees
         pendingRuntimeFrees.removeAll(keepingCapacity: true)
+        let freeingEffects = pendingEffectFrees
+        pendingEffectFrees.removeAll(keepingCapacity: true)
         if let previousGraph {
             retired.append(Retired(
                 graph: previousGraph,
                 lanes: previousLanes,
                 laneCount: previousCount,
                 generation: previousGeneration,
-                laneRuntimes: freeing
+                laneRuntimes: freeing,
+                effects: freeingEffects
             ))
         } else {
             // Nothing was published before, so nothing can be referencing the
             // discarded runtimes.
             for runtime in freeing { RTMemory.destroyLaneRuntime(runtime) }
+            reclaim(freeingEffects)
         }
         collectGarbage()
+    }
+
+    private func makeSlot(_ entry: EffectEntry) -> RTEffectSlot {
+        RTEffectSlot(
+            instance: Unmanaged.passUnretained(entry.instance),
+            runtime: entry.runtime,
+            channels: entry.channels
+        )
+    }
+
+    private func reclaim(_ entries: [EffectEntry]) {
+        for entry in entries {
+            RTMemory.destroyEffectRuntime(entry.runtime)
+            reclaimedEffects.append(entry.instance)
+        }
     }
 
     /// Stops the render thread from seeing any graph. Call after the IOProc
@@ -312,9 +452,16 @@ public final class RTEngineHost {
                 lanes: liveLanes,
                 laneCount: liveLaneCount,
                 generation: liveGraph.pointee.generation,
-                laneRuntimes: pendingRuntimeFrees
+                laneRuntimes: pendingRuntimeFrees,
+                effects: pendingEffectFrees
             ))
             pendingRuntimeFrees.removeAll(keepingCapacity: true)
+            pendingEffectFrees.removeAll(keepingCapacity: true)
+        } else {
+            for runtime in pendingRuntimeFrees { RTMemory.destroyLaneRuntime(runtime) }
+            pendingRuntimeFrees.removeAll(keepingCapacity: true)
+            reclaim(pendingEffectFrees)
+            pendingEffectFrees.removeAll(keepingCapacity: true)
         }
         liveGraph = nil
         liveLanes = nil
@@ -340,6 +487,9 @@ public final class RTEngineHost {
             if renderThreadIdle || exitGeneration > entry.generation {
                 RTMemory.destroyGraph(entry.graph, lanes: entry.lanes, laneCount: entry.laneCount)
                 for runtime in entry.laneRuntimes { RTMemory.destroyLaneRuntime(runtime) }
+                // The plug-ins go on the reclaim list rather than being torn
+                // down here: `teardown()` is main-actor work.
+                reclaim(entry.effects)
             } else {
                 kept.append(entry)
             }

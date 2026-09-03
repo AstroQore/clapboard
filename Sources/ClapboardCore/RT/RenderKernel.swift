@@ -57,6 +57,11 @@ public func render(
     // recordings the common time origin the aligner assumes.
     let capturing = state.pointee.captureArmed.load(ordering: .acquiring)
 
+    // One monotonic frame counter for every plug-in in the graph, read before
+    // the lanes run and advanced once the block is done, so a lane chain and
+    // the master chain see the same block at the same sample time.
+    let sampleTime = state.pointee.sampleTime
+
     let decay = state.pointee.meterDecayPerBlock
     if let lanes = graph.pointee.lanes {
         let laneCount = graph.pointee.laneCount
@@ -68,7 +73,8 @@ public func render(
                 input: input,
                 frames: frames,
                 decay: decay,
-                capturing: capturing
+                capturing: capturing,
+                sampleTime: sampleTime
             )
             index += 1
         }
@@ -83,8 +89,23 @@ public func render(
         state.pointee.captureFrames.store(total, ordering: .releasing)
     }
 
+    // The master chain sees the finished sum and runs before the master
+    // fader, so pulling the fader down does not change what a compressor on
+    // the master bus is being fed.
+    runEffectChain(
+        slots: graph.pointee.masterEffects,
+        count: graph.pointee.masterEffectCount,
+        left: state.pointee.mixLeft,
+        right: state.pointee.mixRight,
+        stereo: true,
+        frames: frames,
+        sampleTime: sampleTime,
+        state: state
+    )
+
     applyMasterGain(state: state, frames: frames)
     publishMasterMeters(state: state, frames: frames, silent: false)
+    state.pointee.sampleTime = sampleTime &+ Int64(frames)
 
     if let output {
         writeMaster(
@@ -108,7 +129,8 @@ private func renderLane(
     input: UnsafePointer<AudioBufferList>?,
     frames: Int,
     decay: Float,
-    capturing: Bool
+    capturing: Bool,
+    sampleTime: Int64
 ) {
     let runtime = node.runtime
     let capacity = RTLimits.delayCapacity
@@ -240,6 +262,20 @@ private func renderLane(
     }
     crossfadeRemaining = crossfadeRemaining > frames ? crossfadeRemaining - frames : 0
 
+    // --- 3b. Effects, in order, in place. After the delay so a plug-in hears
+    // the lane at the position Auto Sync aligned it to, and before the fader
+    // so riding the gain does not change what a compressor is being fed.
+    runEffectChain(
+        slots: node.effects,
+        count: node.effectCount,
+        left: laneLeft,
+        right: laneRight,
+        stereo: channels == 2,
+        frames: frames,
+        sampleTime: sampleTime,
+        state: state
+    )
+
     // --- 4. Gain ramp across the block, then sum into the master.
     let step = (targetGain - smoothedGain) / Float(frames)
     let mixLeft = state.pointee.mixLeft
@@ -290,6 +326,106 @@ private func renderLane(
     runtime.pointee.parameters.meterPeak.store(hold, ordering: .relaxed)
     let meanSquare = sumSquares / Float(frames * channels)
     runtime.pointee.parameters.meterRMS.store(meanSquare > 0 ? sqrtf(meanSquare) : 0, ordering: .relaxed)
+}
+
+// MARK: - Effects
+
+/// Runs one effect chain over a block, in place.
+///
+/// Bypass is crossfaded rather than switched. A hard switch would step by the
+/// whole difference between the dry lane and the plug-in's output — for a
+/// delay or a reverb that is the entire signal — so a slot whose bypass flag
+/// has just moved keeps rendering the plug-in for `RTLimits.crossfadeFrames`
+/// and mixes dry and wet across the ramp. A settled slot is either processed
+/// or skipped outright: a bypassed plug-in costs nothing and the lane passes
+/// through bit for bit.
+///
+/// The `Unmanaged` reference is reached through `_withUnsafeGuaranteedRef`, so
+/// the render thread never touches a retain count. What makes that safe is the
+/// snapshot protocol: `RTEngineHost` holds the strong reference until every
+/// graph that could reach this slot has been reclaimed.
+@inline(__always)
+private func runEffectChain(
+    slots: UnsafeMutablePointer<RTEffectSlot>?,
+    count: Int,
+    left: UnsafeMutablePointer<Float>,
+    right: UnsafeMutablePointer<Float>,
+    stereo: Bool,
+    frames: Int,
+    sampleTime: Int64,
+    state: UnsafeMutablePointer<RTState>
+) {
+    guard let slots, count > 0 else { return }
+    // A mono lane hands the plug-in one channel; `AUEffectInstance` doubles it
+    // internally when the plug-in refused a mono configuration.
+    let wetRight: UnsafeMutablePointer<Float>? = stereo ? right : nil
+    let dryLeft = state.pointee.fxDryLeft
+    let dryRight = state.pointee.fxDryRight
+    let byteCount = frames * MemoryLayout<Float>.size
+    let fadeStep = 1 / Float(RTLimits.crossfadeFrames)
+
+    var index = 0
+    while index < count {
+        let slot = slots[index]
+        index += 1
+        let runtime = slot.runtime
+        let bypassed = runtime.pointee.bypassRequested.load(ordering: .relaxed)
+        let target: Float = bypassed ? 0 : 1
+        if !runtime.pointee.primed {
+            runtime.pointee.primed = true
+            runtime.pointee.bypassMix = target
+        }
+        let mix = runtime.pointee.bypassMix
+
+        slot.instance._withUnsafeGuaranteedRef { instance in
+            guard mix != target else {
+                // Settled. Publishing the state through to the instance keeps
+                // `AUEffectInstance.bypass` — the flag `process` itself reads,
+                // and the one the UI can observe — in step with the kernel.
+                instance.bypass = bypassed
+                if !bypassed {
+                    instance.process(
+                        left: left, right: wetRight, frames: frames, sampleTime: sampleTime)
+                }
+                return
+            }
+            // Fading, in either direction: the plug-in must keep rendering or
+            // there would be no wet signal to fade against.
+            instance.bypass = false
+            memcpy(dryLeft, left, byteCount)
+            if stereo { memcpy(dryRight, right, byteCount) }
+            instance.process(left: left, right: wetRight, frames: frames, sampleTime: sampleTime)
+
+            let step = target > mix ? fadeStep : -fadeStep
+            var value = mix
+            var frame = 0
+            while frame < frames {
+                value += step
+                if step > 0 {
+                    if value > target { value = target }
+                } else if value < target {
+                    value = target
+                }
+                left[frame] = dryLeft[frame] + (left[frame] - dryLeft[frame]) * value
+                frame += 1
+            }
+            if stereo {
+                var rightValue = mix
+                frame = 0
+                while frame < frames {
+                    rightValue += step
+                    if step > 0 {
+                        if rightValue > target { rightValue = target }
+                    } else if rightValue < target {
+                        rightValue = target
+                    }
+                    right[frame] = dryRight[frame] + (right[frame] - dryRight[frame]) * rightValue
+                    frame += 1
+                }
+            }
+            runtime.pointee.bypassMix = value
+        }
+    }
 }
 
 // MARK: - Master
