@@ -24,7 +24,16 @@ struct SessionRestoreTests {
         let engine = AudioEngine()
         engine.restore(original)
         let snapshot = engine.sessionSnapshot
-        #expect(snapshot.lanes == original.lanes)
+        // A version 1 document carries no bus at all; restoring one assigns
+        // every lane to the Master bus `AudioEngine` creates for itself, so
+        // that is the one field the round trip legitimately adds.
+        let masterBusID = engine.buses.first?.id
+        let expectedLanes = original.lanes.map { lane -> LaneConfig in
+            var lane = lane
+            lane.destinationBus = masterBusID
+            return lane
+        }
+        #expect(snapshot.lanes == expectedLanes)
         #expect(snapshot.outputDeviceUID == "the-output")
         #expect(snapshot.masterGainDB == -6)
     }
