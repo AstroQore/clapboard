@@ -636,7 +636,9 @@ public enum SyncSessionMath {
         if let best = zeroed.max(by: { ($0.status.confidence ?? 0) < ($1.status.confidence ?? 0) }) {
             return best.laneID
         }
-        return result.referenceLaneID
+        // Nothing else to prefer: any aligned lane can serve as the frame the
+        // residuals are measured in.
+        return result.alignedLanes.first?.laneID
     }
 
     public static func verify(
@@ -800,7 +802,7 @@ public enum SyncSessionMath {
 
     /// One line of plain advice under the results table, or `nil`.
     public static func advice(for result: SyncResult) -> String? {
-        if result.referenceLaneID == nil {
+        if result.failureSummary != nil || result.alignedLanes.isEmpty {
             let summary = result.failureSummary ?? SyncResult.noClapFailureSummary
             return summary
                 + " Check that the lanes are unmuted and that the levels move,"

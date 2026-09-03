@@ -192,7 +192,33 @@ enum SyncSmokeTest {
         }
 
         say("")
-        say("result   reference=\(result.referenceLaneID.flatMap { id in result[id]?.label } ?? "none") "
+        if !result.pairs.isEmpty {
+            say("pairs")
+            for pair in result.pairs.sorted(by: { $0.offsetSamples < $1.offsetSamples }) {
+                let a = result[pair.a]?.label ?? "?"
+                let b = result[pair.b]?.label ?? "?"
+                say(String(
+                    format: "  %-24@ vs %-24@ %+8.2f sp  w=%5.2f  %@",
+                    a as NSString, b as NSString,
+                    pair.offsetSamples, pair.weight, pair.estimator as NSString
+                ))
+            }
+            for pair in result.droppedPairs {
+                let a = result[pair.a]?.label ?? "?"
+                let b = result[pair.b]?.label ?? "?"
+                say("  dropped as inconsistent: \(a) vs \(b) (\(pair.estimator))")
+            }
+        }
+        if let residual = result.fitResidualSamples {
+            var line = String(format: "fit      residual %.3f samples", residual)
+            if let triangles = result.triangleResidualSamples {
+                line += String(format: ", triangles %.3f samples", triangles)
+            } else {
+                line += ", no triangle to cross-check"
+            }
+            say(line)
+        }
+        say("result   "
             + "aligned=\(result.alignedLanes.count)/\(result.lanes.count)")
         if let failure = result.failureSummary { say("FAILURE  \(failure)") }
         for lane in result.lanes {

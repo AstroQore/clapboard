@@ -249,14 +249,17 @@ enum SyncTestSignals {
 }
 
 extension SyncResult {
-    /// Offset error of a lane against the true arrival delays, in samples,
-    /// expressed against whichever lane the aligner picked as reference.
+    /// Offset error of a lane against the true arrival delays, in samples.
+    ///
+    /// Arrivals are gauge-fixed so the earliest lane the fit placed sits at
+    /// zero, so the truth is put on the same gauge before comparing. There is
+    /// no reference lane to express this against any more.
     func offsetError(laneID: UUID, truth: [UUID: Double]) -> Double? {
-        guard let referenceLaneID, let referenceDelay = truth[referenceLaneID],
-              let measured = self[laneID]?.status.offsetSamples,
-              let trueDelay = truth[laneID]
+        guard let measured = self[laneID]?.status.offsetSamples,
+              let trueDelay = truth[laneID],
+              let earliest = alignedLanes.compactMap({ truth[$0.laneID] }).min()
         else { return nil }
-        return measured - (trueDelay - referenceDelay)
+        return measured - (trueDelay - earliest)
     }
 }
 

@@ -82,6 +82,32 @@ public struct SyncOptions: Sendable, Equatable {
     /// less than this.
     public var multiTakeAgreementSeconds: Double
 
+    /// Hop of the energy envelope used by the pair estimator. It sets the
+    /// resolution of the coarse bracket, not of the final answer.
+    public var envelopeHopSeconds: Double
+
+    /// Pearson correlation an envelope match must reach before a pair is
+    /// believed. Envelopes of the same clap on two microphones correlate well
+    /// above 0.8; unrelated noise sits near zero.
+    public var minEnvelopeCorrelation: Double
+
+    /// How far the waveform estimator may sit from the envelope bracket and
+    /// still be believed. Beyond it the two disagree and the pair is refused
+    /// rather than guessed at.
+    public var waveformAgreementSeconds: Double
+
+    /// Peak-to-runner-up ratio the waveform correlation must reach *inside*
+    /// the envelope bracket.
+    ///
+    /// It is lower than `minPeakRatio` on purpose. That one guarded a search
+    /// across the whole +/-250 ms window, where a spurious peak has hundreds of
+    /// milliseconds of noise to win in; here the search is a few milliseconds
+    /// wide, so the same ratio is much stronger evidence. This is the gate
+    /// that proves two lanes recorded the *same* event rather than two events
+    /// that merely look alike: every clap has a similar energy envelope, but
+    /// only the same clap shares a waveform.
+    public var minBracketedPeakRatio: Double
+
     public init(
         maxLagSeconds: Double = 0.25,
         minOnsetSNRdB: Double = 12,
@@ -99,7 +125,11 @@ public struct SyncOptions: Sendable, Equatable {
         onsetProximityToleranceSeconds: Double = 0.010,
         secondPeakExclusionSeconds: Double = 0.001,
         silenceThreshold: Float = 1e-5,
-        multiTakeAgreementSeconds: Double = 0.0005
+        multiTakeAgreementSeconds: Double = 0.0005,
+        envelopeHopSeconds: Double = 0.00025,
+        minEnvelopeCorrelation: Double = 0.4,
+        waveformAgreementSeconds: Double = 0.003,
+        minBracketedPeakRatio: Double = 1.8
     ) {
         self.maxLagSeconds = maxLagSeconds
         self.minOnsetSNRdB = minOnsetSNRdB
@@ -118,6 +148,10 @@ public struct SyncOptions: Sendable, Equatable {
         self.secondPeakExclusionSeconds = secondPeakExclusionSeconds
         self.silenceThreshold = silenceThreshold
         self.multiTakeAgreementSeconds = multiTakeAgreementSeconds
+        self.envelopeHopSeconds = envelopeHopSeconds
+        self.minEnvelopeCorrelation = minEnvelopeCorrelation
+        self.waveformAgreementSeconds = waveformAgreementSeconds
+        self.minBracketedPeakRatio = minBracketedPeakRatio
     }
 
     /// `maxLagSeconds` clamped to the supported 1 ms ... 1 s range.

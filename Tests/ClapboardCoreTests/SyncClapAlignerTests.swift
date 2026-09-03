@@ -29,7 +29,8 @@ struct SyncClapAlignerTests {
         let take = SyncTestSignals.makeTake([near, middle, far], seed: UInt64(snrdB) &+ 11)
         let result = aligner.analyze(take.lanes)
 
-        #expect(result.referenceLaneID != nil)
+        #expect(result.failureSummary == nil)
+        #expect(result.arrivals.count == take.lanes.count)
         for lane in take.lanes {
             let laneResult = result[lane.laneID]
             #expect(
@@ -110,7 +111,8 @@ struct SyncClapAlignerTests {
         let take = SyncTestSignals.makeTake([loud, quiet], seed: 77)
         let result = aligner.analyze(take.lanes)
 
-        #expect(result.referenceLaneID == take.lanes[0].laneID)
+        // Both lanes are placed by the fit; neither anchors the other.
+        #expect(result.arrivals.count == 2)
         #expect(result[take.lanes[1].laneID]?.status.isAligned == true)
         let error = result.offsetError(laneID: take.lanes[1].laneID, truth: take.truth) ?? .infinity
         #expect(abs(error) <= 1.0, "quiet lane off by \(error) samples")
@@ -171,8 +173,8 @@ struct SyncClapAlignerTests {
         #expect(foreignStatus?.notDetectedReason?.contains("ambiguous") == true)
     }
 
-    @Test("a virtual lane is measured but never becomes the reference")
-    func neverPicksVirtualLaneAsReference() {
+    @Test("a virtual lane is placed by agreement with the real microphones")
+    func placesVirtualLaneByAgreement() {
         var virtualLane = LaneSpec("Loopback")
         virtualLane.snrdB = 60
         virtualLane.isVirtual = true
@@ -186,8 +188,11 @@ struct SyncClapAlignerTests {
         let take = SyncTestSignals.makeTake([virtualLane, mic, otherMic], seed: 5150)
         let result = aligner.analyze(take.lanes)
 
-        #expect(result.referenceLaneID != take.lanes[0].laneID)
-        #expect(result.referenceLaneID != nil)
+        // A virtual device replays somebody else's clock, so it used to be
+        // barred from anchoring the take. Nothing anchors the take now: it is
+        // placed only in so far as the real microphones agree with it.
+        #expect(result.failureSummary == nil)
+        #expect(result.arrivals[take.lanes[0].laneID] != nil)
         #expect(result[take.lanes[0].laneID]?.status.isAligned == true)
         let error = result.offsetError(laneID: take.lanes[0].laneID, truth: take.truth) ?? .infinity
         #expect(abs(error) <= 1.0, "virtual lane off by \(error) samples")
@@ -302,8 +307,8 @@ struct SyncClapAlignerTests {
         }
 
         let result = aligner.analyze(lanes)
-        #expect(result.referenceLaneID != nil)
         #expect(result.failureSummary == nil)
+        #expect(result.arrivals.count == lanes.count)
         for lane in lanes {
             #expect(result[lane.laneID]?.status.isAligned == true, "\(lane.label)")
             #expect(result[lane.laneID]?.levels?.multipleTransients == true, "\(lane.label)")
@@ -324,7 +329,7 @@ struct SyncClapAlignerTests {
         let heard = SyncTestSignals.makeRoomTake([near, far], seed: seed)
         let result = aligner.analyze(heard.lanes)
         #expect(result.failureSummary == nil)
-        #expect(result.referenceLaneID != nil)
+        #expect(result.arrivals.count == heard.lanes.count)
         for lane in heard.lanes {
             #expect(result[lane.laneID]?.status.isAligned == true, "\(lane.label)")
             let error = result.offsetError(laneID: lane.laneID, truth: heard.truth) ?? .infinity
@@ -425,7 +430,7 @@ struct SyncClapAlignerTests {
         }
 
         let result = aligner.analyzeMultiple(aligned)
-        #expect(result.referenceLaneID != nil)
+        #expect(result.failureSummary == nil)
         for laneResult in result.lanes {
             #expect(laneResult.status.isAligned == true, "\(laneResult.label)")
             #expect((laneResult.status.confidence ?? 0) > 0.5)
