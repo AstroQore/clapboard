@@ -313,6 +313,9 @@ struct EffectPickerSheet: View {
             footer
         }
         .frame(width: 520, height: 460)
+        // The search field earns focus when the user types; nothing should be
+        // ringed just because the sheet opened.
+        .clapboardNoInitialFocus()
         .task { await load() }
     }
 
