@@ -188,6 +188,45 @@ Clapboard --restore-session /tmp/session.json --run 5
 back — including which ones point at devices that are not here — and runs the
 engine for a few seconds, so the lane statuses are measured rather than assumed.
 
+## Shortcuts and the menu bar
+
+The point of a mixer you run while streaming is that you never have to look at
+it, so Clapboard keeps a microphone in the menu bar — `mic.fill` while
+something is live, `mic.slash.fill` when everything is muted, dimmed while the
+engine is stopped — and registers **global keyboard shortcuts** that fire while
+another app is in front.
+
+Out of the box `⌃⌥M` is 闭麦 / 开麦 on one key: it mutes every lane and
+remembers which ones were live, and pressing it again puts exactly that set
+back. A lane you had deliberately muted stays muted. "Mute all" and "unmute
+all" exist separately for a one-way key, and "unmute all" means *all* — it is
+the escape hatch out of a state you no longer trust, so it ignores the memory
+the toggle key honours. Any lane can also get a shortcut of its own, and
+everything on the keyboard is on the menu-bar menu too, with a checkmark per
+lane.
+
+Edit them in **Clapboard › Settings…** (`⌘,`): click a shortcut to record a
+new one, `⎋` cancels, `⌫` clears. A key needs ⌃, ⌥ or ⌘ — or is an F-key,
+which is what makes F13–F20 on a stream deck the natural mute button.
+
+The shortcuts use Carbon's `RegisterEventHotKey`, not
+`NSEvent.addGlobalMonitorForEvents`, so they need **no Accessibility
+permission** and they *swallow* the key: press the mute key in OBS and OBS does
+not also see it. The one thing macOS will not tell us is whether it has already
+claimed a combination for itself — registration succeeds and the system keeps
+the key — so the settings sheet flashes the row green when a shortcut actually
+reaches Clapboard. A row that never lights up is a key someone else owns.
+
+Bindings live in `~/Library/Application Support/Clapboard/hotkeys.json`,
+separately from the session: a mixer gets rebuilt when the rig changes, muscle
+memory does not. The file is written atomically and read forgivingly — a
+binding this build cannot understand is dropped and reported, never a reason to
+lose the rest.
+
+Bus and solo shortcuts are reserved but not implemented; they are decoded and
+shown as "coming soon" so a file from a later build survives a round-trip
+through this one.
+
 ## Headless commands
 
 The executable doubles as a command-line tool. These flags are dispatched in
@@ -205,7 +244,14 @@ $BIN --engine-test 5 --output Loopback --lane "MacBook Pro Microphone" --save-se
 $BIN --restore-session /tmp/s.json --run 3
 $BIN --session-dump
 $BIN --session-autosave-test
+$BIN --hotkeys-selftest                 # register every binding, report per binding, release
+$BIN --hotkeys-selftest --hotkeys-path /tmp/hotkeys.json --reset
 ```
+
+`--hotkeys-selftest` loads the hotkey file (writing the default set when there
+is none), registers every binding with Carbon, prints `noErr` or the failure
+per binding, unregisters and exits — non-zero when any binding was refused. It
+is the only way to check the shortcut path without a human pressing keys.
 
 Every mode destroys its private aggregate device on exit, including on
 SIGTERM / SIGINT (`pkill`, Ctrl-C). Do not `kill -9` a running instance: a
@@ -254,6 +300,7 @@ Sources/ClapboardApp          app entry, controllers, views
 Driver/Sources               ClapboardDriver.driver, a Core Audio AudioServerPlugIn (M6)
 Driver/Harness               offline driver tests — no coreaudiod, no install
 Driver/Packaging             pkgbuild/productbuild scripts and installer resources
+Sources/ClapboardApp/Hotkeys  global shortcuts, key recorder, menu-bar item
 Scripts/build_app.sh          bundle + sign .build/Clapboard.app
 Scripts/build_driver.sh       build + sign + test .build/ClapboardDriver.driver
 Scripts/build_driver_pkg.sh   wrap the driver into .build/ClapboardDriver.pkg

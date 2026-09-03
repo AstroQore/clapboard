@@ -9,6 +9,7 @@ struct ClapboardApp: App {
     @State private var permission = MicrophonePermission()
     @State private var engine = AudioEngine()
     @State private var session = SessionController()
+    @State private var hotkeys = HotkeyManager()
 
     var body: some Scene {
         WindowGroup("Clapboard") {
@@ -37,11 +38,21 @@ struct ClapboardApp: App {
                     // the process, but not if the HAL outlives us by a beat.
                     appDelegate.engine = engine
                     appDelegate.session = session
+                    // Restore first: a per-lane shortcut is keyed on a lane id,
+                    // so the lanes have to exist before the bindings are read.
+                    hotkeys.start(engine: engine)
+                    appDelegate.hotkeys = hotkeys
+                    appDelegate.installStatusItem(engine: engine, hotkeys: hotkeys)
                 }
         }
         .defaultSize(width: 1080, height: 660)
         .commands {
             CommandGroup(after: .toolbar) {
+                Button("Mute All Microphones") { hotkeys.perform(.muteAllLanes) }
+                    .disabled(engine.lanes.isEmpty)
+                Button("Unmute All Microphones") { hotkeys.perform(.unmuteAllLanes) }
+                    .disabled(engine.lanes.isEmpty)
+                Divider()
                 Button(engine.runState.isRunning ? "Stop Engine" : "Run Engine") {
                     engine.runState.isRunning ? engine.stop() : engine.start()
                 }
@@ -52,6 +63,11 @@ struct ClapboardApp: App {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(!engine.runState.isRunning)
             }
+        }
+
+        // ⌘, comes free with a `Settings` scene.
+        Settings {
+            HotkeysSettingsView(hotkeys: hotkeys, engine: engine)
         }
     }
 }

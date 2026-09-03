@@ -11,7 +11,8 @@ enum HeadlessCommand {
         "--sync-test",
         "--restore-session",
         "--session-dump",
-        "--session-autosave-test"
+        "--session-autosave-test",
+        "--hotkeys-selftest"
     ]
 
     static func matches(_ arguments: [String]) -> Bool {
@@ -31,6 +32,9 @@ enum HeadlessCommand {
         }
         if arguments.contains("--sync-test") {
             SyncSmokeTest.run(arguments: arguments)
+        }
+        if arguments.contains("--hotkeys-selftest") {
+            HotkeySelfTest.run(arguments: arguments)
         }
         if arguments.contains("--restore-session")
             || arguments.contains("--session-dump")
