@@ -10,12 +10,19 @@ import Synchronization
 /// runtime metadata, no class references. Everything it touches hangs off
 /// `state`, which the IOProc block captures by value as a single pointer.
 ///
+/// Order (`docs/ROUTING.md`): clear every bus accumulator, render every lane
+/// into its destination bus's accumulator, then walk the buses in topological
+/// order — children before parents — running each one's PDC delay, effects,
+/// gain/mute ramp and meters before adding its output into its parent's
+/// accumulator and/or writing it to an output device's buffer.
+///
 /// - Parameters:
 ///   - state: engine-lifetime state, allocated by `RTMemory.makeState()`.
 ///   - input: the HAL's input `AudioBufferList` — one interleaved Float32
 ///     buffer per input stream, in sub-device order. May be `nil`.
 ///   - output: the HAL's output `AudioBufferList`. Every buffer is cleared;
-///     the master mix goes into the buffer the graph nominates.
+///     each bus with an output device writes into the buffer the graph
+///     nominates for it.
 ///   - frames: frames in this block.
 public func render(
     state: UnsafeMutablePointer<RTState>,
@@ -35,13 +42,11 @@ public func render(
         return
     }
 
-    let mixLeft = state.pointee.mixLeft
-    let mixRight = state.pointee.mixRight
-    vDSP_vclr(mixLeft, 1, vDSP_Length(frames))
-    vDSP_vclr(mixRight, 1, vDSP_Length(frames))
-
     guard let graphRaw = state.pointee.graph.load(ordering: .acquiring) else {
-        publishMasterMeters(state: state, frames: frames, silent: true)
+        // Nothing published yet (or the engine is between stop and the next
+        // start). Bus meters live in persistent runtimes the graph does not
+        // own, so there is nothing here to decay — the output was already
+        // cleared above.
         return
     }
     let graph = graphRaw.assumingMemoryBound(to: RTGraph.self)
@@ -59,16 +64,33 @@ public func render(
 
     // One monotonic frame counter for every plug-in in the graph, read before
     // the lanes run and advanced once the block is done, so a lane chain and
-    // the master chain see the same block at the same sample time.
+    // every bus chain see the same block at the same sample time.
     let sampleTime = state.pointee.sampleTime
-
     let decay = state.pointee.meterDecayPerBlock
+
+    let buses = graph.pointee.buses
+    let busCount = graph.pointee.busCount
+
+    // --- 1. Clear every bus accumulator before anything sums into it.
+    if let buses {
+        var index = 0
+        while index < busCount {
+            let runtime = buses.advanced(by: index).pointee.runtime
+            vDSP_vclr(runtime.pointee.accumulatorLeft, 1, vDSP_Length(frames))
+            vDSP_vclr(runtime.pointee.accumulatorRight, 1, vDSP_Length(frames))
+            index += 1
+        }
+    }
+
+    // --- 2. Lanes: each one sums into its destination bus's accumulator.
     if let lanes = graph.pointee.lanes {
         let laneCount = graph.pointee.laneCount
         var index = 0
         while index < laneCount {
             renderLane(
                 node: lanes.advanced(by: index).pointee,
+                buses: buses,
+                busCount: busCount,
                 state: state,
                 input: input,
                 frames: frames,
@@ -89,34 +111,26 @@ public func render(
         state.pointee.captureFrames.store(total, ordering: .releasing)
     }
 
-    // The master chain sees the finished sum and runs before the master
-    // fader, so pulling the fader down does not change what a compressor on
-    // the master bus is being fed.
-    runEffectChain(
-        slots: graph.pointee.masterEffects,
-        count: graph.pointee.masterEffectCount,
-        left: state.pointee.mixLeft,
-        right: state.pointee.mixRight,
-        stereo: true,
-        frames: frames,
-        sampleTime: sampleTime,
-        state: state
-    )
-
-    applyMasterGain(state: state, frames: frames)
-    publishMasterMeters(state: state, frames: frames, silent: false)
-    state.pointee.sampleTime = sampleTime &+ Int64(frames)
-
-    if let output {
-        writeMaster(
-            state: state,
-            output: output,
-            frames: frames,
-            bufferIndex: graph.pointee.outputBufferIndex,
-            channelOffset: graph.pointee.outputChannelOffset
-        )
+    // --- 3. Buses, in topological order: every bus is fully summed (lanes
+    // plus any child bus that already ran) by the time its turn comes.
+    if let buses {
+        var index = 0
+        while index < busCount {
+            renderBus(
+                index: index,
+                buses: buses,
+                busCount: busCount,
+                state: state,
+                output: output,
+                frames: frames,
+                decay: decay,
+                sampleTime: sampleTime
+            )
+            index += 1
+        }
     }
 
+    state.pointee.sampleTime = sampleTime &+ Int64(frames)
     state.pointee.exitGeneration.store(generation, ordering: .releasing)
 }
 
@@ -125,6 +139,8 @@ public func render(
 @inline(__always)
 private func renderLane(
     node: RTLaneNode,
+    buses: UnsafeMutablePointer<RTBusNode>?,
+    busCount: Int,
     state: UnsafeMutablePointer<RTState>,
     input: UnsafePointer<AudioBufferList>?,
     frames: Int,
@@ -276,10 +292,24 @@ private func renderLane(
         state: state
     )
 
-    // --- 4. Gain ramp across the block, then sum into the master.
+    // --- 4. Gain ramp across the block, then sum into the destination bus.
+    // A lane whose bus is gone (`busIndex` out of range) sums into the fx-dry
+    // scratch instead of an accumulator: the effect chain above has already
+    // finished with it for this lane, so it is free, and nothing downstream
+    // ever reads it back out — the lane still gets a meter, it just reaches
+    // no bus.
+    let mixLeft: UnsafeMutablePointer<Float>
+    let mixRight: UnsafeMutablePointer<Float>
+    if let buses, node.busIndex >= 0, node.busIndex < busCount {
+        let busRuntime = buses.advanced(by: node.busIndex).pointee.runtime
+        mixLeft = busRuntime.pointee.accumulatorLeft
+        mixRight = busRuntime.pointee.accumulatorRight
+    } else {
+        mixLeft = state.pointee.fxDryLeft
+        mixRight = state.pointee.fxDryRight
+    }
+
     let step = (targetGain - smoothedGain) / Float(frames)
-    let mixLeft = state.pointee.mixLeft
-    let mixRight = state.pointee.mixRight
     var peak: Float = 0
     var sumSquares: Float = 0
     var value = smoothedGain
@@ -290,7 +320,7 @@ private func renderLane(
             let magnitude = sample < 0 ? -sample : sample
             if magnitude > peak { peak = magnitude }
             sumSquares += sample * sample
-            // A mono lane feeds both master channels at unity, matching how a
+            // A mono lane feeds both bus channels at unity, matching how a
             // mono source sits centred in a stereo mix.
             mixLeft[frame] += sample
             mixRight[frame] += sample
@@ -326,6 +356,184 @@ private func renderLane(
     runtime.pointee.parameters.meterPeak.store(hold, ordering: .relaxed)
     let meanSquare = sumSquares / Float(frames * channels)
     runtime.pointee.parameters.meterRMS.store(meanSquare > 0 ? sqrtf(meanSquare) : 0, ordering: .relaxed)
+}
+
+// MARK: - Bus
+
+/// Renders one bus in place: its accumulator already holds the sum of every
+/// lane and every child bus that feeds it (child buses run earlier in
+/// `buses`, which is topological). PDC delay, then effects, then the gain/mute
+/// ramp and meters, then the result is added into the parent's accumulator
+/// and/or written to this bus's output buffer.
+@inline(__always)
+private func renderBus(
+    index: Int,
+    buses: UnsafeMutablePointer<RTBusNode>,
+    busCount: Int,
+    state: UnsafeMutablePointer<RTState>,
+    output: UnsafeMutablePointer<AudioBufferList>?,
+    frames: Int,
+    decay: Float,
+    sampleTime: Int64
+) {
+    let node = buses.advanced(by: index).pointee
+    let runtime = node.runtime
+    let capacity = RTLimits.delayCapacity
+    let ring = runtime.pointee.ring
+    let accumulatorLeft = runtime.pointee.accumulatorLeft
+    let accumulatorRight = runtime.pointee.accumulatorRight
+
+    // --- 1. Capture this block's sum into the bus's own delay ring, the same
+    // way a lane captures the HAL input into its ring — reused here as the
+    // bus's PDC delay line.
+    let writeIndex = runtime.pointee.writeIndex
+    var position = writeIndex
+    var frame = 0
+    while frame < frames {
+        ring[position] = accumulatorLeft[frame]
+        ring[capacity + position] = accumulatorRight[frame]
+        position += 1
+        if position == capacity { position = 0 }
+        frame += 1
+    }
+    runtime.pointee.writeIndex = (writeIndex + frames) % capacity
+
+    // --- 2. Parameters.
+    let enabled = runtime.pointee.parameters.enabled.load(ordering: .relaxed)
+    let gain = runtime.pointee.parameters.gainLinear.load(ordering: .relaxed)
+    var requestedDelay = runtime.pointee.parameters.delaySamples.load(ordering: .relaxed)
+    if requestedDelay < 0 { requestedDelay = 0 }
+    if requestedDelay > RTLimits.maxDelaySamples { requestedDelay = RTLimits.maxDelaySamples }
+    let targetGain: Float = enabled ? gain : 0
+
+    let primed = runtime.pointee.primed
+    var activeDelay = runtime.pointee.activeDelay
+    var previousDelay = runtime.pointee.previousDelay
+    var crossfadeRemaining = runtime.pointee.crossfadeRemaining
+    var smoothedGain = runtime.pointee.smoothedGain
+
+    if !primed {
+        runtime.pointee.primed = true
+        smoothedGain = targetGain
+        activeDelay = requestedDelay
+        previousDelay = requestedDelay
+        crossfadeRemaining = 0
+    } else if requestedDelay != activeDelay {
+        previousDelay = activeDelay
+        activeDelay = requestedDelay
+        crossfadeRemaining = RTLimits.crossfadeFrames
+    }
+
+    // --- 3. Playback: read the ring at the current delay, crossfading from
+    // the old read head when the compensation just changed. Written into the
+    // lane scratch buffers — every lane has already summed into an
+    // accumulator and finished with them by the time any bus runs.
+    let busLeft = state.pointee.laneLeft
+    let busRight = state.pointee.laneRight
+    let fadeLength = Float(RTLimits.crossfadeFrames)
+    let fadeStart = RTLimits.crossfadeFrames - crossfadeRemaining
+
+    var channel = 0
+    while channel < 2 {
+        let base = ring.advanced(by: channel * capacity)
+        let target = channel == 0 ? busLeft : busRight
+        var indexA = (writeIndex + capacity - activeDelay) % capacity
+        var indexB = (writeIndex + capacity - previousDelay) % capacity
+        frame = 0
+        while frame < frames {
+            let a = base[indexA]
+            if crossfadeRemaining > frame {
+                let mixPosition = Float(fadeStart + frame + 1) / fadeLength
+                let mix = mixPosition > 1 ? 1 : mixPosition
+                target[frame] = base[indexB] * (1 - mix) + a * mix
+            } else {
+                target[frame] = a
+            }
+            indexA += 1
+            if indexA == capacity { indexA = 0 }
+            indexB += 1
+            if indexB == capacity { indexB = 0 }
+            frame += 1
+        }
+        channel += 1
+    }
+    crossfadeRemaining = crossfadeRemaining > frames ? crossfadeRemaining - frames : 0
+
+    // --- 3b. This bus's own effect chain, after the delay and before the
+    // fader, same placement as a lane's.
+    runEffectChain(
+        slots: node.effects,
+        count: node.effectCount,
+        left: busLeft,
+        right: busRight,
+        stereo: true,
+        frames: frames,
+        sampleTime: sampleTime,
+        state: state
+    )
+
+    // --- 4. Gain ramp and meters.
+    let step = (targetGain - smoothedGain) / Float(frames)
+    var peakLeft: Float = 0
+    var peakRight: Float = 0
+    var sumSquares: Float = 0
+    var value = smoothedGain
+    frame = 0
+    while frame < frames {
+        let left = busLeft[frame] * value
+        let right = busRight[frame] * value
+        busLeft[frame] = left
+        busRight[frame] = right
+        let magnitudeL = left < 0 ? -left : left
+        let magnitudeR = right < 0 ? -right : right
+        if magnitudeL > peakLeft { peakLeft = magnitudeL }
+        if magnitudeR > peakRight { peakRight = magnitudeR }
+        sumSquares += left * left + right * right
+        value += step
+        frame += 1
+    }
+    smoothedGain = targetGain
+
+    runtime.pointee.smoothedGain = smoothedGain
+    runtime.pointee.activeDelay = activeDelay
+    runtime.pointee.previousDelay = previousDelay
+    runtime.pointee.crossfadeRemaining = crossfadeRemaining
+
+    var holdLeft = runtime.pointee.peakHoldLeft * decay
+    if peakLeft > holdLeft { holdLeft = peakLeft }
+    var holdRight = runtime.pointee.peakHoldRight * decay
+    if peakRight > holdRight { holdRight = peakRight }
+    runtime.pointee.peakHoldLeft = holdLeft
+    runtime.pointee.peakHoldRight = holdRight
+    runtime.pointee.parameters.meterPeakLeft.store(holdLeft, ordering: .relaxed)
+    runtime.pointee.parameters.meterPeakRight.store(holdRight, ordering: .relaxed)
+    let meanSquare = sumSquares / Float(frames * 2)
+    runtime.pointee.parameters.meterRMS.store(meanSquare > 0 ? sqrtf(meanSquare) : 0, ordering: .relaxed)
+
+    // --- 5. Fan out: into the parent bus's accumulator (already cleared and
+    // not yet processed, since the array is topological) and/or this bus's
+    // own output buffer.
+    if node.parentBusIndex >= 0, node.parentBusIndex < busCount {
+        let parentRuntime = buses.advanced(by: node.parentBusIndex).pointee.runtime
+        let parentLeft = parentRuntime.pointee.accumulatorLeft
+        let parentRight = parentRuntime.pointee.accumulatorRight
+        frame = 0
+        while frame < frames {
+            parentLeft[frame] += busLeft[frame]
+            parentRight[frame] += busRight[frame]
+            frame += 1
+        }
+    }
+    if let output, node.outputBufferIndex >= 0 {
+        writeBusOutput(
+            output: output,
+            left: busLeft,
+            right: busRight,
+            frames: frames,
+            bufferIndex: node.outputBufferIndex,
+            channelOffset: node.outputChannelOffset
+        )
+    }
 }
 
 // MARK: - Effects
@@ -428,60 +636,6 @@ private func runEffectChain(
     }
 }
 
-// MARK: - Master
-
-@inline(__always)
-private func applyMasterGain(state: UnsafeMutablePointer<RTState>, frames: Int) {
-    let target = state.pointee.masterGainLinear.load(ordering: .relaxed)
-    var value = state.pointee.masterSmoothedGain
-    if !state.pointee.masterPrimed {
-        state.pointee.masterPrimed = true
-        value = target
-    }
-    let step = (target - value) / Float(frames)
-    let mixLeft = state.pointee.mixLeft
-    let mixRight = state.pointee.mixRight
-    var frame = 0
-    while frame < frames {
-        mixLeft[frame] *= value
-        mixRight[frame] *= value
-        value += step
-        frame += 1
-    }
-    state.pointee.masterSmoothedGain = target
-}
-
-@inline(__always)
-private func publishMasterMeters(state: UnsafeMutablePointer<RTState>, frames: Int, silent: Bool) {
-    let decay = state.pointee.meterDecayPerBlock
-    var peakLeft: Float = 0
-    var peakRight: Float = 0
-    var sumSquares: Float = 0
-    if !silent {
-        let mixLeft = state.pointee.mixLeft
-        let mixRight = state.pointee.mixRight
-        var frame = 0
-        while frame < frames {
-            let left = mixLeft[frame]
-            let right = mixRight[frame]
-            let magnitudeL = left < 0 ? -left : left
-            let magnitudeR = right < 0 ? -right : right
-            if magnitudeL > peakLeft { peakLeft = magnitudeL }
-            if magnitudeR > peakRight { peakRight = magnitudeR }
-            sumSquares += left * left + right * right
-            frame += 1
-        }
-    }
-    var holdLeft = state.pointee.masterPeakLeft.load(ordering: .relaxed) * decay
-    if peakLeft > holdLeft { holdLeft = peakLeft }
-    var holdRight = state.pointee.masterPeakRight.load(ordering: .relaxed) * decay
-    if peakRight > holdRight { holdRight = peakRight }
-    state.pointee.masterPeakLeft.store(holdLeft, ordering: .relaxed)
-    state.pointee.masterPeakRight.store(holdRight, ordering: .relaxed)
-    let meanSquare = sumSquares / Float(frames * 2)
-    state.pointee.masterRMS.store(meanSquare > 0 ? sqrtf(meanSquare) : 0, ordering: .relaxed)
-}
-
 // MARK: - AudioBufferList plumbing
 
 @inline(__always)
@@ -522,9 +676,10 @@ private func sourcePointer(
 }
 
 @inline(__always)
-private func writeMaster(
-    state: UnsafeMutablePointer<RTState>,
+private func writeBusOutput(
     output: UnsafeMutablePointer<AudioBufferList>,
+    left: UnsafeMutablePointer<Float>,
+    right: UnsafeMutablePointer<Float>,
     frames: Int,
     bufferIndex: Int,
     channelOffset: Int
@@ -537,15 +692,13 @@ private func writeMaster(
     guard channels > channelOffset, let data = buffer.mData else { return }
     guard Int(buffer.mDataByteSize) >= frames * channels * MemoryLayout<Float>.size else { return }
     let samples = data.assumingMemoryBound(to: Float.self)
-    let mixLeft = state.pointee.mixLeft
-    let mixRight = state.pointee.mixRight
     let writeRight = channels > channelOffset + 1
     var frame = 0
     while frame < frames {
         let base = frame * channels + channelOffset
-        samples[base] = mixLeft[frame]
+        samples[base] = left[frame]
         if writeRight {
-            samples[base + 1] = mixRight[frame]
+            samples[base + 1] = right[frame]
         }
         frame += 1
     }

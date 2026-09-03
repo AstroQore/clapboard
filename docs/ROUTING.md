@@ -1,8 +1,14 @@
 # Routing model (design, v2)
 
-Status: **design, not implemented**. This is the specification the bus-routing
-work is built from. `docs/ARCHITECTURE.md` describes what exists today: lanes
-summed into one master with one output device.
+Status: **implemented**, except the two sections marked **not implemented**
+below (Projects, and the console UI — the row-based mixer still runs the new
+model underneath). The model (`BusConfig`, `RoutingGraph`, `SoloLogic`,
+`LatencyPlan`), the real-time bus graph, a private aggregate device with
+several output devices, the `AudioEngine` bus API, session format 2 with
+version 1 migration, and the headless `--engine-test`/`--routing-selftest`
+coverage below are all in `main`. `docs/ARCHITECTURE.md`'s signal-flow diagram
+still shows the pre-bus single-master shape and needs updating to match this
+document; treat this file as authoritative for routing until then.
 
 ## Goals
 
@@ -100,7 +106,23 @@ destinations); their total latency is reported per output as "output latency".
 Migration from version 1: create the `Master` bus from `outputDeviceUID`,
 `masterGainDB` and `masterExtras.effects`; point every lane at it.
 
-## Projects
+`laneExtras` still carries every lane's chain exactly as before — a
+`LaneConfig` has no inline `effects` field, unlike a bus — so it is not
+actually vestigial the way `masterExtras` is; it is shown empty above only
+because this particular example session has no lane effects. `masterExtras`
+itself is read for version 1 migration and otherwise always written empty,
+since a bus's chain now travels on `BusConfig.effects` instead, master
+included.
+
+One scope note beyond what shipped: only the Master bus's chain is
+loaded back into a live Audio Unit instance on restore (`addEffect(toLane:)`
+covers lanes and Master; nothing yet offers per-bus effect editing for any
+other bus). A chain saved on a non-master bus still round-trips — its
+`EffectConfig`s, including `fullState`, come back exactly as saved — but as a
+placeholder, the same "state kept, not live" contract an uninstalled plug-in
+already gets.
+
+## Projects — not implemented
 
 The autosaved session stays where it is (`~/Library/Application Support/
 Clapboard/session.json`) and is what opens on launch. In addition:
@@ -121,9 +143,11 @@ When the Clapboard driver is installed, its devices appear as ordinary output
 devices named `Clapboard Bus n` (UID `com.astroqore.Clapboard.bus.n`). The bus
 strip's output picker lists them first and offers "Auto-assign a Clapboard
 Bus" which picks the lowest unused one. Nothing in the routing model depends
-on the driver.
+on the driver — `setBusOutput`/`AggregateDeviceRequest.outputDeviceUIDs` treat
+a `Clapboard Bus n` UID the same as any other output device — but the picker
+UI itself, described here, has not been built.
 
-## UI
+## UI — not implemented
 
 Vertical strips in a horizontally scrolling console: lane strips on the left,
 bus strips on the right, separated by a thin divider. Each strip, top to
@@ -132,3 +156,11 @@ bottom: name (editable), source / destination pickers, effect chips, delay
 vertical fader, `M` / `S` buttons. Bus strips add the output device picker and
 an "output latency" read-out. The existing row-based mixer is kept behind a
 view toggle until the console view has been used for a while.
+
+The row-based mixer (`MixerView`/`LaneRowView`) is unchanged and still runs
+against the Master bus only, via the thin shims `AudioEngine` keeps for it
+(`setOutputDevice`, `masterGainDB`, `masterEffects`, `masterMeter`); it has no
+way to add a bus, route a lane anywhere else, or solo. The full `AudioEngine`
+API above (`addBus`, `setLaneDestination`, `setBusSolo`, …) is reachable today
+only from the headless `--engine-test`/`--routing-selftest` flags documented
+there, pending this console view.

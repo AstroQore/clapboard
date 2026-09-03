@@ -356,12 +356,16 @@ struct EffectChainTests {
         #expect(saved[0].bypass)
         #expect(saved[0].componentID == "aufx.dely.appl")
         #expect(saved[0].fullState != nil, "AUDelay published no state")
-        #expect(document.masterExtras[EffectChainCodec.extrasKey] != nil)
+        // A bus carries its chain inline — format 2 no longer routes the
+        // master bus's effects through `masterExtras`.
+        let masterBus = try #require(document.buses.first)
+        #expect(masterBus.effects.map(\.id) == [master.id])
+        #expect(document.masterExtras[EffectChainCodec.extrasKey] == nil)
 
         // Through JSON and back, the way the session file travels.
         let round = try SessionDocument.decode(try document.jsonData())
         #expect(round.laneExtras == document.laneExtras)
-        #expect(round.masterExtras == document.masterExtras)
+        #expect(round.buses == document.buses)
         engine.shutdown()
 
         let reopened = AudioEngine()

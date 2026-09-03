@@ -214,14 +214,19 @@ extension AudioEngine {
         chainLatency(laneEffects[laneID] ?? [])
     }
 
-    public var masterChainLatency: Int { chainLatency(masterEffects) }
+    /// Shim onto `busChainLatency(masterBusID)`, kept because it reads nicer
+    /// at call sites that only ever dealt with the one bus.
+    public var masterChainLatency: Int { busChainLatency(masterBusID) }
 
-    /// The lane the whole mix has to wait for.
+    /// The lane the whole mix has to wait for, regardless of which bus it
+    /// feeds. Superseded by `LatencyPlan.inputAlignment` for the actual
+    /// per-bus compensation `pushEffectiveDelays()` pushes, but still a
+    /// useful single-number diagnostic.
     public var maxLaneChainLatency: Int {
         lanes.reduce(0) { max($0, laneChainLatency($1.id)) }
     }
 
-    private func chainLatency(_ chain: [EffectConfig]) -> Int {
+    func chainLatency(_ chain: [EffectConfig]) -> Int {
         chain.reduce(0) { total, config in
             guard !config.bypass, config.isAvailable else { return total }
             return total + effectLatencySamples(id: config.id)
@@ -229,45 +234,68 @@ extension AudioEngine {
     }
 
     /// What the render thread's delay line is actually set to: the manual (or
-    /// Auto Sync measured) delay, plus enough extra to make up the difference
-    /// between this lane's chain latency and the slowest lane's.
+    /// Auto Sync measured) delay, plus whatever `LatencyPlan` computed for
+    /// this lane across the whole bus tree.
     public func effectiveDelaySamples(forLane laneID: UUID) -> Int {
         guard let lane = lane(id: laneID) else { return 0 }
-        let wanted = lane.delaySamples + max(0, maxLaneChainLatency - laneChainLatency(laneID))
+        let wanted = lane.delaySamples + (latencyPlan.laneCompensation[laneID] ?? 0)
         return min(max(0, wanted), RTLimits.maxDelaySamples)
     }
 
-    /// Latency the mix adds end to end, in samples: the slowest lane's chain —
-    /// which every other lane is now delayed to match — plus the master chain,
-    /// which is common to all of them and therefore not compensated at all.
+    /// Legacy single-bus diagnostic: the slowest lane's chain plus the master
+    /// chain, as if every lane fed the master bus directly. Still exactly
+    /// right when that is true (the common case); for a multi-bus mix use
+    /// `outputLatencySamples(forDevice:)`, which is what `latencyPlan`
+    /// actually drives.
     public var outputLatencySamples: Int { maxLaneChainLatency + masterChainLatency }
 
     public var outputLatencyMilliseconds: Double {
         Double(outputLatencySamples) / AudioEngine.effectSampleRate * 1000
     }
 
-    /// Recomputes every lane's compensated delay and writes it to the render
-    /// thread. Cheap — a handful of atomic stores — and called from every edit
-    /// that can move a latency: chain edits, bypass, a plug-in reporting a new
-    /// latency, lane add/remove, and the manual delay itself.
+    /// Recomputes plug-in delay compensation across the whole routing tree —
+    /// every lane against the others feeding its bus, every bus against its
+    /// siblings — and writes the result to the render thread. Cheap: a
+    /// `LatencyPlan.compute` pass plus a handful of atomic stores. Called from
+    /// every edit that can move a latency: chain edits, bypass, a plug-in
+    /// reporting a new latency, lane/bus add/remove/re-route, and the manual
+    /// delay itself.
     public func pushEffectiveDelays() {
-        let ceiling = maxLaneChainLatency
-        var clampedLanes: [String] = []
+        let laneLatencies = Dictionary(uniqueKeysWithValues: lanes.map { ($0.id, laneChainLatency($0.id)) })
+        let busLatencies = Dictionary(uniqueKeysWithValues: buses.map { ($0.id, busChainLatency($0.id)) })
+        let plan = LatencyPlan.compute(graph: graph, laneChainLatency: laneLatencies, busChainLatency: busLatencies)
+        latencyPlan = plan
+
+        // `plan.clamped` only catches compensation the plan itself had to
+        // clip; a lane's own manual/measured delay can push the *combined*
+        // value over the ceiling even when its compensation alone was fine,
+        // so that combine has to be checked here too.
+        var clampedIDs = plan.clamped
         var added: [UUID: Int] = [:]
         for lane in lanes {
-            let compensation = max(0, ceiling - laneChainLatency(lane.id))
+            let compensation = plan.laneCompensation[lane.id] ?? 0
+            added[lane.id] = compensation
             let wanted = lane.delaySamples + compensation
             let clamped = min(max(0, wanted), RTLimits.maxDelaySamples)
-            if clamped != wanted { clampedLanes.append(lane.name) }
-            added[lane.id] = compensation
+            if clamped != wanted { clampedIDs.insert(lane.id) }
             host.setLaneDelay(lane.id, samples: clamped)
         }
         pdcSamples = added
-        pdcWarning = clampedLanes.isEmpty
-            ? nil
-            : "Delay compensation exceeds the \(RTLimits.maxDelaySamples / 48) ms delay limit on "
-                + "\(clampedLanes.joined(separator: ", ")) — those lanes are no longer aligned. "
+
+        for bus in buses {
+            host.setBusDelay(bus.id, samples: plan.busCompensation[bus.id] ?? 0)
+        }
+
+        if clampedIDs.isEmpty {
+            pdcWarning = nil
+        } else {
+            let names = clampedIDs.compactMap { id in
+                lane(id: id)?.name ?? bus(id: id)?.name
+            }
+            pdcWarning = "Delay compensation exceeds the \(RTLimits.maxDelaySamples / 48) ms delay limit on "
+                + "\(names.joined(separator: ", ")) — those strips are no longer aligned. "
                 + "Bypass a high-latency plug-in or lower the manual delay."
+        }
     }
 
     // MARK: - Teardown

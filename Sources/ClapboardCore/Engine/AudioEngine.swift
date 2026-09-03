@@ -42,8 +42,34 @@ public final class AudioEngine {
 
     // MARK: - Observable state
 
-    public private(set) var lanes: [LaneConfig] = []
-    public private(set) var outputDeviceUID: String?
+    public internal(set) var lanes: [LaneConfig] = []
+    /// Every bus in the mixer, in no particular order (`RoutingGraph.order`,
+    /// derived from this, is what the render thread and the topological
+    /// queries use). Always has at least one entry — `removeBus` refuses to
+    /// drop the last one, and the initial `Master` bus besides.
+    public internal(set) var buses: [BusConfig] = []
+    /// The bus `setOutputDevice`/`masterGainDB`/`masterEffects`/`masterMeter`
+    /// are thin shims onto. Fixed at creation and never removable, so those
+    /// APIs — and the UI built on them — always have somewhere to point.
+    var masterBusID = UUID()
+    /// The validated routing tree built from `lanes` and `buses`. Rebuilt by
+    /// `rebuildRoutingGraph()` on every topology edit; a rebuild that would
+    /// fail (an edit that was not pre-validated, or a hand-edited session)
+    /// leaves this at its last good value and records `routingError` instead
+    /// of publishing a broken graph.
+    var graph: RoutingGraph
+    /// Set by `rebuildRoutingGraph()` when `lanes`/`buses` do not form a legal
+    /// graph. `nil` in ordinary operation, since every topology-editing method
+    /// validates before mutating.
+    public private(set) var routingError: RoutingError?
+    /// The plug-in delay compensation `pushEffectiveDelays()` last computed
+    /// across the whole bus tree. `outputLatencySamples(forDevice:)` and the
+    /// per-lane/per-bus PDC read-outs are views onto this.
+    public internal(set) var latencyPlan: LatencyPlan = .empty
+    /// What `muteAllLanes()` remembers to give back on `unmuteAllLanes()`/
+    /// `toggleAllLanes()` — see `MuteToggleLogic`. Buses are never part of
+    /// mute-all, only lanes.
+    var mutedLanesRemembered: Set<UUID> = []
     public private(set) var runState: RunState = .stopped
     public private(set) var lastError: String?
     /// Sub-device drift compensation inserts a resampler whose latency is not
@@ -61,18 +87,36 @@ public final class AudioEngine {
     /// state so a session opened without that plug-in can be saved again
     /// without losing it, and it is not published to the render thread.
     public internal(set) var laneEffects: [UUID: [EffectConfig]] = [:]
-    /// The master bus chain, after the sum and before the master fader.
-    public internal(set) var masterEffects: [EffectConfig] = []
+    /// The master bus's chain, after the sum and before its fader. A thin
+    /// shim onto `buses[masterBusID].effects` — `BusConfig` is where a bus's
+    /// chain actually lives now, master included.
+    public internal(set) var masterEffects: [EffectConfig] {
+        get { buses.first { $0.id == masterBusID }?.effects ?? [] }
+        set {
+            guard let index = buses.firstIndex(where: { $0.id == masterBusID }) else { return }
+            buses[index].effects = newValue
+        }
+    }
     /// Extra delay plug-in delay compensation is adding to each lane, in
     /// samples. Purely derived; the UI shows it next to the manual delay.
     public internal(set) var pdcSamples: [UUID: Int] = [:]
-    /// Set when a lane's compensated delay had to be clamped to
+    /// Set when a lane's or a bus's compensated delay had to be clamped to
     /// `RTLimits.maxDelaySamples`, which means the mix is no longer aligned.
     public internal(set) var pdcWarning: String?
     /// True while a restored session's chains are still being instantiated.
     public internal(set) var restoringEffects = false
-    public var masterGainDB: Float = 0 {
-        didSet { host.setMasterGain(linear: Decibels.linear(masterGainDB)) }
+    /// Thin shim onto the master bus's own gain — kept so the existing UI
+    /// and any code written against the pre-bus API keep working unchanged.
+    public var masterGainDB: Float {
+        get { buses.first { $0.id == masterBusID }?.gainDB ?? 0 }
+        set { setBusGainDB(masterBusID, newValue) }
+    }
+    /// Thin shim onto the master bus's own output device. Several other
+    /// buses may target other devices — `buses`/`RoutingGraph.outputDeviceUIDs`
+    /// is the full picture — but this is what the pre-bus UI and every
+    /// headless single-output flow still read and write.
+    public var outputDeviceUID: String? {
+        buses.first { $0.id == masterBusID }?.outputDeviceUID
     }
     public private(set) var microphoneAuthorized = false
 
@@ -112,7 +156,14 @@ public final class AudioEngine {
     private var sawFirstCallback = false
 
     public init() {
+        let master = BusConfig(name: BusConfig.masterName)
+        buses = [master]
+        masterBusID = master.id
+        // A single bus with no destination and no lanes cannot be a cycle or
+        // point anywhere invalid, so this can never actually throw.
+        graph = try! RoutingGraph.build(lanes: [], buses: [master])
         host.setMeterDecay(framesPerBlock: 256, sampleRate: 48_000)
+        host.runtime(forBus: master.id)
         refreshAuthorization()
         TerminationGuard.register(self)
     }
@@ -147,6 +198,14 @@ public final class AudioEngine {
     /// M4 plug-in state) attached to the right lane across a relaunch.
     @discardableResult
     public func addLane(_ lane: LaneConfig) -> LaneConfig {
+        var lane = lane
+        // A lane always has a destination bus (`docs/ROUTING.md`): assign the
+        // Master bus the moment one is missing, or points at a bus that is no
+        // longer here — the only way either happens is a hand-edited or
+        // stale-format session file.
+        if lane.destinationBus == nil || !buses.contains(where: { $0.id == lane.destinationBus }) {
+            lane.destinationBus = masterBusID
+        }
         lanes.append(lane)
         host.runtime(for: lane.id)
         pushParameters(lane)
@@ -201,7 +260,7 @@ public final class AudioEngine {
 
     public func setLaneEnabled(_ id: UUID, _ enabled: Bool) {
         mutate(id) { $0.enabled = enabled }
-        host.setLaneEnabled(id, enabled)
+        refreshEffectiveEnable()
     }
 
     public func setLanePolarity(_ id: UUID, inverted: Bool) {
@@ -230,12 +289,12 @@ public final class AudioEngine {
         applyTopologyChange()
     }
 
+    /// Thin shim onto `setBusOutput(id:deviceUID:channelOffset:)` for the
+    /// master bus — what the pre-bus UI and every single-output headless flow
+    /// still call.
     public func setOutputDevice(uid: String?) {
         guard outputDeviceUID != uid else { return }
-        outputDeviceUID = uid
-        // Lane sources may no longer be legal (the output device can never be
-        // a lane source), and the aggregate's clock main changed.
-        lanes.removeAll { $0.deviceUID == uid }
+        setBusOutput(id: masterBusID, deviceUID: uid, channelOffset: 0)
         if runState.isRunning || runState.isBusy {
             rebuild(reason: "output device changed")
         }
@@ -339,8 +398,8 @@ public final class AudioEngine {
     // MARK: - Meters
 
     public func meter(laneID: UUID) -> MeterReading { host.laneMeter(laneID) }
-    public var masterMeter: MeterReading { host.masterMeter }
-    public var masterPeaks: (left: Float, right: Float) { host.masterPeaks }
+    public var masterMeter: MeterReading { host.busMeter(masterBusID) }
+    public var masterPeaks: (left: Float, right: Float) { host.busPeaks(masterBusID) }
     public var callbackCount: Int { host.callbackCount }
     public var droppedBlocks: Int { host.droppedBlocks }
 
@@ -403,12 +462,14 @@ public final class AudioEngine {
     private func launch(context: String?) {
         lastError = nil
         runState = .starting
-        guard let outputDeviceUID else {
+        rebuildRoutingGraph()
+        let outputs = graph.outputDeviceUIDs
+        guard !outputs.isEmpty else {
             fail("Pick an output device first.")
             return
         }
         do {
-            try bringUp(outputDeviceUID: outputDeviceUID)
+            try bringUp(outputDeviceUIDs: outputs)
             sawFirstCallback = false
             runState = .running
             startWatchdog()
@@ -468,7 +529,7 @@ public final class AudioEngine {
     }
 
     private func makeDependencyFingerprint() -> [String] {
-        let uids = orderedInputDeviceUIDs() + (outputDeviceUID.map { [$0] } ?? [])
+        let uids = orderedInputDeviceUIDs() + graph.outputDeviceUIDs
         let known = knownDevices()
         return uids.map { uid in
             guard let device = known.first(where: { $0.uid == uid }) else { return "\(uid)|gone" }
@@ -498,11 +559,11 @@ public final class AudioEngine {
 
     // MARK: - Bring-up
 
-    private func bringUp(outputDeviceUID: String) throws {
+    private func bringUp(outputDeviceUIDs: [String]) throws {
         let inputUIDs = orderedInputDeviceUIDs()
         let device = try AggregateDevice.create(AggregateDeviceRequest(
             inputDeviceUIDs: inputUIDs,
-            outputDeviceUID: outputDeviceUID,
+            outputDeviceUIDs: outputDeviceUIDs,
             sampleRate: 48_000,
             bufferFrameSize: 256,
             name: "Clapboard Mix"
@@ -516,7 +577,7 @@ public final class AudioEngine {
             host.runtime(for: lane.id)
             pushParameters(lane)
         }
-        host.setMasterGain(linear: Decibels.linear(masterGainDB))
+        for bus in buses { host.runtime(forBus: bus.id) }
         // Chains survive a stop/start and every aggregate rebuild — reloading
         // a plug-in would drop its state and its editor window — but their
         // tails do not: a 20-second delay must not keep ringing across the
@@ -586,21 +647,75 @@ public final class AudioEngine {
     // MARK: - Graph
 
     /// A topology edit only needs a full restart when the aggregate does not
-    /// already carry every device the lanes want. Adding or removing a lane on
-    /// a device that is already a sub-device is a snapshot swap, which is
-    /// click-free.
-    private func applyTopologyChange() {
+    /// already carry every device the lanes and the buses want. Adding or
+    /// removing a lane on a device that is already a sub-device, or
+    /// re-routing a lane or a bus to a different bus, is a snapshot swap,
+    /// which is click-free; only the *set* of input or output devices
+    /// changing needs the aggregate itself rebuilt.
+    func applyTopologyChange() {
+        rebuildRoutingGraph()
         guard runState.isRunning || runState.isBusy else {
             republishGraph()
             return
         }
-        let wanted = Set(orderedInputDeviceUIDs())
-        let present = Set(aggregate?.inputDeviceUIDs ?? [])
-        if wanted.isSubset(of: present) {
+        let wantedInputs = Set(orderedInputDeviceUIDs())
+        let presentInputs = Set(aggregate?.inputDeviceUIDs ?? [])
+        let wantedOutputs = Set(graph.outputDeviceUIDs)
+        let presentOutputs = Set(aggregate?.outputDeviceUIDs ?? [])
+        if wantedInputs.isSubset(of: presentInputs), wantedOutputs.isSubset(of: presentOutputs) {
             republishGraph()
             dependencyFingerprint = makeDependencyFingerprint()
         } else {
-            rebuild(reason: "lane needs a device the aggregate does not have")
+            rebuild(reason: "routing needs a device the aggregate does not have")
+        }
+    }
+
+    /// Rebuilds `graph` from the current `lanes`/`buses`. Every topology-
+    /// editing method validates its own edit before mutating (an unknown bus,
+    /// a cycle), so this should never actually fail in ordinary operation —
+    /// the guard exists for a hand-edited or stale-format session file, which
+    /// gets `routingError` instead of a crash or a silently wrong mix. On
+    /// failure the previous (still legal) graph is kept, so the render thread
+    /// keeps running whatever it was last correctly told to.
+    func rebuildRoutingGraph() {
+        do {
+            graph = try RoutingGraph.build(lanes: lanes, buses: buses)
+            routingError = nil
+        } catch let error as RoutingError {
+            routingError = error
+        } catch {
+            routingError = nil
+        }
+    }
+
+    /// Recomputes `!muted && (no solo in scope || solo)` for every lane and
+    /// bus and pushes the result straight to the render thread's atomics.
+    /// Cheap — `SoloLogic` is pure arithmetic over what is already in memory —
+    /// so every mute/solo edit calls this directly rather than going through
+    /// a full `republishGraph()`.
+    func refreshEffectiveEnable() {
+        let effective = SoloLogic.effectiveEnabled(lanes: lanes, buses: buses, graph: graph)
+        for lane in lanes {
+            host.setLaneEnabled(lane.id, effective.lanes[lane.id] ?? lane.enabled)
+        }
+        for bus in buses {
+            host.setBusEnabled(bus.id, effective.buses[bus.id] ?? !bus.muted)
+        }
+    }
+
+    func mutateBus(_ id: UUID, _ body: (inout BusConfig) -> Void) {
+        guard let index = buses.firstIndex(where: { $0.id == id }) else { return }
+        body(&buses[index])
+    }
+
+    /// A lane whose device just became (one of) the mix's output devices
+    /// would feed the mix back into itself; `AggregateDevice.create` refuses
+    /// that outright, so it is dropped here first rather than surfacing as a
+    /// bring-up failure the next time the engine starts.
+    func dropLanesConflictingWithOutputs() {
+        let outputs = Set(buses.compactMap(\.outputDeviceUID))
+        for id in lanes.filter({ outputs.contains($0.deviceUID) }).map(\.id) {
+            removeLane(id: id)
         }
     }
 
@@ -615,11 +730,12 @@ public final class AudioEngine {
     /// fingerprint changes and `handleHardwareChange` rebuilds.
     private func orderedInputDeviceUIDs() -> [String] {
         let present = Set(knownDevices().map(\.uid))
+        let outputs = Set(graph.outputDeviceUIDs)
         var seen = Set<String>()
         var result: [String] = []
         for lane in lanes
         where !seen.contains(lane.deviceUID)
-            && lane.deviceUID != outputDeviceUID
+            && !outputs.contains(lane.deviceUID)
             && present.contains(lane.deviceUID) {
             seen.insert(lane.deviceUID)
             result.append(lane.deviceUID)
@@ -631,6 +747,12 @@ public final class AudioEngine {
         registry?.devices ?? ((try? AudioDeviceInfo.enumerateAll()) ?? [])
     }
 
+    /// Publishes a fresh `RTGraph` snapshot from the current `lanes`/`buses`
+    /// and `graph` (the validated routing tree). Every bus is published, in
+    /// `graph.order` — children before parents, exactly what the render
+    /// kernel needs — with its parent resolved to an index, its output
+    /// resolved to a buffer via `AggregateDevice.outputSlot(forDeviceUID:)`,
+    /// and its chain patched in.
     func republishGraph() {
         guard let aggregate else {
             host.unpublish()
@@ -685,13 +807,36 @@ public final class AudioEngine {
             ))
         }
         laneStatus = status
+
+        // Gain and effective enable (mute + solo scope) are parameter-only —
+        // no snapshot needed — but this is the one place guaranteed to run
+        // after every topology edit, so it is the simplest place to make sure
+        // they are never stale.
+        refreshEffectiveEnable()
+        for bus in buses {
+            host.setBusGain(bus.id, linear: Decibels.linear(bus.gainDB))
+        }
+
+        var busInfos: [RTEngineHost.BusPublishInfo] = []
+        busInfos.reserveCapacity(graph.order.count)
+        for busID in graph.order {
+            guard let bus = buses.first(where: { $0.id == busID }) else { continue }
+            let slot = bus.outputDeviceUID.flatMap(aggregate.outputSlot(forDeviceUID:))
+            busInfos.append(RTEngineHost.BusPublishInfo(
+                id: busID,
+                parentID: graph.parent[busID],
+                outputBufferIndex: slot?.bufferIndex ?? -1,
+                outputChannelOffset: min(bus.outputChannelOffset, max(0, (slot?.channelCount ?? 1) - 1)),
+                outputChannelsInBuffer: slot?.channelCount ?? 0,
+                effectIDs: publishableEffectIDs(bus.effects)
+            ))
+        }
+
         host.publish(
-            nodes: nodes,
-            outputBufferIndex: aggregate.masterOutputBufferIndex,
-            outputChannelsInBuffer: aggregate.masterOutputChannels,
-            outputChannelOffset: 0,
+            laneNodes: nodes,
+            laneBusIDs: lanes.map(\.destinationBus),
             laneEffectIDs: lanes.map { publishableEffectIDs(laneEffects[$0.id]) },
-            masterEffectIDs: publishableEffectIDs(masterEffects)
+            buses: busInfos
         )
     }
 

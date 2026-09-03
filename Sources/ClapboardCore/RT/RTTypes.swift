@@ -22,8 +22,8 @@ public enum RTLimits {
     /// Crossfade length when a delay changes: ~10 ms at 48 kHz. The same
     /// length is used when an effect's bypass flips.
     @inline(__always) public static var crossfadeFrames: Int { 480 }
-    /// Effects one lane — or the master bus — may carry. A cap exists only so
-    /// the host can reject a pathological chain before it reaches the render
+    /// Effects one lane — or one bus — may carry. A cap exists only so the
+    /// host can reject a pathological chain before it reaches the render
     /// thread; nothing in the kernel iterates a fixed number of slots.
     @inline(__always) public static var maxEffectsPerChain: Int { 16 }
 }
@@ -111,6 +111,64 @@ public struct LaneRuntime: ~Copyable {
     }
 }
 
+/// Parameters a bus strip exposes to the render thread. Same shape as
+/// `LaneParameters`, because a bus strip is the same console strip: gain,
+/// mute, meter — plus the delay line plug-in delay compensation drives.
+public struct BusParameters: ~Copyable {
+    public let gainLinear = Atomic<Float>(1)
+    /// Effective enable: `!muted` combined with the solo scope, computed on
+    /// the main thread by `SoloLogic`.
+    public let enabled = Atomic<Bool>(true)
+    /// Compensation delay applied before the bus's effects, so siblings under
+    /// one parent arrive together.
+    public let delaySamples = Atomic<Int>(0)
+    public let meterPeakLeft = Atomic<Float>(0)
+    public let meterPeakRight = Atomic<Float>(0)
+    public let meterRMS = Atomic<Float>(0)
+
+    public init() {}
+}
+
+/// Everything one bus must remember between blocks.
+///
+/// Allocated once per bus id and kept across graph rebuilds for the same
+/// reason `LaneRuntime` is: re-routing a lane must not reset an unrelated
+/// bus's delay line or gain smoother, or the mix clicks on every edit.
+///
+/// The accumulator is where the lanes and child buses pointed at this bus sum
+/// themselves; it is cleared at the top of every block before any lane runs.
+public struct BusRuntime: ~Copyable {
+    public var parameters = BusParameters()
+
+    /// Stereo sum for this block, `maxFramesPerBlock` floats each.
+    var accumulatorLeft: UnsafeMutablePointer<Float>
+    var accumulatorRight: UnsafeMutablePointer<Float>
+
+    /// The same planar ring the lanes use — `laneChannels * delayCapacity`
+    /// floats — driven by the same crossfading read head, so a compensation
+    /// change slides instead of clicking.
+    var ring: UnsafeMutablePointer<Float>
+    var writeIndex: Int = 0
+    var activeDelay: Int = 0
+    var previousDelay: Int = 0
+    var crossfadeRemaining: Int = 0
+
+    var smoothedGain: Float = 0
+    var primed: Bool = false
+    var peakHoldLeft: Float = 0
+    var peakHoldRight: Float = 0
+
+    init(
+        accumulatorLeft: UnsafeMutablePointer<Float>,
+        accumulatorRight: UnsafeMutablePointer<Float>,
+        ring: UnsafeMutablePointer<Float>
+    ) {
+        self.accumulatorLeft = accumulatorLeft
+        self.accumulatorRight = accumulatorRight
+        self.ring = ring
+    }
+}
+
 /// Everything one hosted effect must remember between blocks.
 ///
 /// Allocated once per effect id by `RTEngineHost` and — like `LaneRuntime` —
@@ -172,8 +230,12 @@ public struct RTEffectSlot {
 /// kernel feeds it silence rather than dropping the lane.
 public struct RTLaneNode {
     public var runtime: UnsafeMutablePointer<LaneRuntime>
-    /// 1 (mono, fed to both master channels) or 2 (stereo).
+    /// 1 (mono, fed to both bus channels) or 2 (stereo).
     public var channelCount: Int
+    /// Index into `RTGraph.buses` of the bus this lane sums into. `-1` marks a
+    /// lane whose destination is gone; it still runs its delay line and meter
+    /// but reaches nothing.
+    public var busIndex: Int
     public var bufferIndex0: Int
     public var channelInBuffer0: Int
     public var channelsInBuffer0: Int
@@ -188,6 +250,7 @@ public struct RTLaneNode {
     public init(
         runtime: UnsafeMutablePointer<LaneRuntime>,
         channelCount: Int,
+        busIndex: Int = -1,
         bufferIndex0: Int,
         channelInBuffer0: Int,
         channelsInBuffer0: Int,
@@ -199,6 +262,7 @@ public struct RTLaneNode {
     ) {
         self.runtime = runtime
         self.channelCount = channelCount
+        self.busIndex = busIndex
         self.bufferIndex0 = bufferIndex0
         self.channelInBuffer0 = channelInBuffer0
         self.channelsInBuffer0 = channelsInBuffer0
@@ -210,50 +274,73 @@ public struct RTLaneNode {
     }
 }
 
+/// One bus as the render thread sees it: its persistent state, its chain, and
+/// the two places its output can go.
+public struct RTBusNode {
+    public var runtime: UnsafeMutablePointer<BusRuntime>
+    /// The bus's chain, pointing into the snapshot's flat slot storage.
+    public var effects: UnsafeMutablePointer<RTEffectSlot>?
+    public var effectCount: Int
+    /// Index into `RTGraph.buses` of the bus this one feeds, or `-1`.
+    /// Always greater than this bus's own index: the array is topological.
+    public var parentBusIndex: Int
+    /// Buffer in the IOProc output list this bus writes to, or `-1`.
+    public var outputBufferIndex: Int
+    public var outputChannelOffset: Int
+    public var outputChannelsInBuffer: Int
+
+    public init(
+        runtime: UnsafeMutablePointer<BusRuntime>,
+        effects: UnsafeMutablePointer<RTEffectSlot>? = nil,
+        effectCount: Int = 0,
+        parentBusIndex: Int = -1,
+        outputBufferIndex: Int = -1,
+        outputChannelOffset: Int = 0,
+        outputChannelsInBuffer: Int = 0
+    ) {
+        self.runtime = runtime
+        self.effects = effects
+        self.effectCount = effectCount
+        self.parentBusIndex = parentBusIndex
+        self.outputBufferIndex = outputBufferIndex
+        self.outputChannelOffset = outputChannelOffset
+        self.outputChannelsInBuffer = outputChannelsInBuffer
+    }
+}
+
 /// Immutable graph topology. Published to the render thread by atomic pointer
 /// swap and never mutated once visible.
 public struct RTGraph {
     public var generation: UInt64
     public var laneCount: Int
     public var lanes: UnsafeMutablePointer<RTLaneNode>?
-    /// Index of the output `AudioBuffer` the master mix is written into. This
-    /// is *not* always 0: an input sub-device that also has output streams
-    /// contributes buffers ahead of the chosen output device.
-    public var outputBufferIndex: Int
-    public var outputChannelsInBuffer: Int
-    /// First master channel inside that buffer (0 for a plain stereo stream).
-    public var outputChannelOffset: Int
+    /// Buses in processing order: every bus comes before the bus it feeds, so
+    /// one forward pass renders the whole tree.
+    public var buses: UnsafeMutablePointer<RTBusNode>?
+    public var busCount: Int
 
     /// Flat storage for every slot in the snapshot: each lane's chain in lane
-    /// order, then the master chain. One allocation, freed with the graph;
-    /// `RTLaneNode.effects` and `masterEffects` point into it.
+    /// order, then each bus's chain in bus order. One allocation, freed with
+    /// the graph; `RTLaneNode.effects` and `RTBusNode.effects` point into it.
     public var effectSlots: UnsafeMutablePointer<RTEffectSlot>?
     public var effectSlotCount: Int
-    public var masterEffects: UnsafeMutablePointer<RTEffectSlot>?
-    public var masterEffectCount: Int
 
     public init(
         generation: UInt64,
         laneCount: Int,
         lanes: UnsafeMutablePointer<RTLaneNode>?,
-        outputBufferIndex: Int,
-        outputChannelsInBuffer: Int,
-        outputChannelOffset: Int = 0,
+        buses: UnsafeMutablePointer<RTBusNode>? = nil,
+        busCount: Int = 0,
         effectSlots: UnsafeMutablePointer<RTEffectSlot>? = nil,
-        effectSlotCount: Int = 0,
-        masterEffects: UnsafeMutablePointer<RTEffectSlot>? = nil,
-        masterEffectCount: Int = 0
+        effectSlotCount: Int = 0
     ) {
         self.generation = generation
         self.laneCount = laneCount
         self.lanes = lanes
-        self.outputBufferIndex = outputBufferIndex
-        self.outputChannelsInBuffer = outputChannelsInBuffer
-        self.outputChannelOffset = outputChannelOffset
+        self.buses = buses
+        self.busCount = busCount
         self.effectSlots = effectSlots
         self.effectSlotCount = effectSlotCount
-        self.masterEffects = masterEffects
-        self.masterEffectCount = masterEffectCount
     }
 }
 
@@ -269,11 +356,6 @@ public struct RTState: ~Copyable {
     /// the render thread holds no graph, which is what makes retired
     /// snapshots safe to free.
     public let exitGeneration = Atomic<UInt64>(0)
-
-    public let masterGainLinear = Atomic<Float>(1)
-    public let masterPeakLeft = Atomic<Float>(0)
-    public let masterPeakRight = Atomic<Float>(0)
-    public let masterRMS = Atomic<Float>(0)
 
     public let overloadCount = Atomic<UInt64>(0)
     public let callbackCount = Atomic<UInt64>(0)
@@ -294,15 +376,15 @@ public struct RTState: ~Copyable {
     /// Plain: written before `captureArmed` is released.
     var captureRequestedFrames: Int = 0
 
-    /// Master accumulators, `maxFramesPerBlock` floats each.
-    var mixLeft: UnsafeMutablePointer<Float>
-    var mixRight: UnsafeMutablePointer<Float>
-    /// Per-lane scratch, `maxFramesPerBlock` floats each.
+    /// Per-lane and per-bus scratch, `maxFramesPerBlock` floats each. The
+    /// mix accumulators moved into `BusRuntime` when buses landed: every bus
+    /// owns its own sum, and only one strip is being rendered at a time.
     var laneLeft: UnsafeMutablePointer<Float>
     var laneRight: UnsafeMutablePointer<Float>
     /// Dry copies taken while an effect's bypass is crossfading. Effects run
-    /// strictly one at a time — lane chains in lane order, then the master
-    /// chain — so one pair of buffers serves every slot in the graph.
+    /// strictly one at a time — lane chains in lane order, then each bus's
+    /// chain in bus order — so one pair of buffers serves every slot in the
+    /// graph.
     var fxDryLeft: UnsafeMutablePointer<Float>
     var fxDryRight: UnsafeMutablePointer<Float>
 
@@ -311,24 +393,17 @@ public struct RTState: ~Copyable {
     /// to advance monotonically; only the render thread touches it.
     var sampleTime: Int64 = 0
 
-    var masterSmoothedGain: Float = 1
-    var masterPrimed: Bool = false
-
     /// Peak-hold decay applied once per block. Set by the host from the
     /// negotiated block size; a fixed per-block factor keeps `powf` off the
     /// render thread.
     var meterDecayPerBlock: Float = 0.98
 
     init(
-        mixLeft: UnsafeMutablePointer<Float>,
-        mixRight: UnsafeMutablePointer<Float>,
         laneLeft: UnsafeMutablePointer<Float>,
         laneRight: UnsafeMutablePointer<Float>,
         fxDryLeft: UnsafeMutablePointer<Float>,
         fxDryRight: UnsafeMutablePointer<Float>
     ) {
-        self.mixLeft = mixLeft
-        self.mixRight = mixRight
         self.laneLeft = laneLeft
         self.laneRight = laneRight
         self.fxDryLeft = fxDryLeft
@@ -349,8 +424,6 @@ public enum RTMemory {
         let frames = RTLimits.maxFramesPerBlock
         let state = UnsafeMutablePointer<RTState>.allocate(capacity: 1)
         state.initialize(to: RTState(
-            mixLeft: makeSilentBuffer(count: frames),
-            mixRight: makeSilentBuffer(count: frames),
             laneLeft: makeSilentBuffer(count: frames),
             laneRight: makeSilentBuffer(count: frames),
             fxDryLeft: makeSilentBuffer(count: frames),
@@ -360,8 +433,6 @@ public enum RTMemory {
     }
 
     public static func destroyState(_ state: UnsafeMutablePointer<RTState>) {
-        state.pointee.mixLeft.deallocate()
-        state.pointee.mixRight.deallocate()
         state.pointee.laneLeft.deallocate()
         state.pointee.laneRight.deallocate()
         state.pointee.fxDryLeft.deallocate()
@@ -399,6 +470,28 @@ public enum RTMemory {
         runtime.deallocate()
     }
 
+    /// Allocates one bus's persistent state: a stereo accumulator plus the same
+    /// shape of delay ring a lane uses (reused for the bus's PDC delay line).
+    public static func makeBusRuntime() -> UnsafeMutablePointer<BusRuntime> {
+        let frames = RTLimits.maxFramesPerBlock
+        let ring = makeSilentBuffer(count: RTLimits.laneChannels * RTLimits.delayCapacity)
+        let runtime = UnsafeMutablePointer<BusRuntime>.allocate(capacity: 1)
+        runtime.initialize(to: BusRuntime(
+            accumulatorLeft: makeSilentBuffer(count: frames),
+            accumulatorRight: makeSilentBuffer(count: frames),
+            ring: ring
+        ))
+        return runtime
+    }
+
+    public static func destroyBusRuntime(_ runtime: UnsafeMutablePointer<BusRuntime>) {
+        runtime.pointee.accumulatorLeft.deallocate()
+        runtime.pointee.accumulatorRight.deallocate()
+        runtime.pointee.ring.deallocate()
+        runtime.deinitialize(count: 1)
+        runtime.deallocate()
+    }
+
     /// Allocates the snapshot's flat effect-slot storage, or `nil` when the
     /// graph carries no effects at all.
     public static func makeEffectSlots(_ slots: [RTEffectSlot]) -> UnsafeMutablePointer<RTEffectSlot>? {
@@ -411,55 +504,64 @@ public enum RTMemory {
     }
 
     /// - Parameters:
-    ///   - nodes: lane nodes whose `effects` pointers already point into
-    ///     `effectSlots`. `RTEngineHost` does that patching, because it is the
-    ///     only place that knows which chain belongs to which lane.
+    ///   - laneNodes: lane nodes whose `effects` pointers already point into
+    ///     `effectSlots` and whose `busIndex` already refers to `busNodes`.
+    ///   - busNodes: bus nodes in topological order (children before
+    ///     parents), whose `effects`/`parentBusIndex` are already resolved.
+    ///     `RTEngineHost` does all of that patching, because it is the only
+    ///     place that knows which chain and which parent belongs to which id.
     ///   - effectSlots: flat slot storage from `makeEffectSlots`, owned by the
     ///     graph from here on.
-    ///   - masterEffectOffset: where the master chain starts inside it.
     public static func makeGraph(
         generation: UInt64,
-        nodes: [RTLaneNode],
-        outputBufferIndex: Int,
-        outputChannelsInBuffer: Int,
-        outputChannelOffset: Int,
+        laneNodes: [RTLaneNode],
+        busNodes: [RTBusNode],
         effectSlots: UnsafeMutablePointer<RTEffectSlot>? = nil,
-        effectSlotCount: Int = 0,
-        masterEffectOffset: Int = 0,
-        masterEffectCount: Int = 0
-    ) -> (graph: UnsafeMutablePointer<RTGraph>, lanes: UnsafeMutablePointer<RTLaneNode>?) {
+        effectSlotCount: Int = 0
+    ) -> (graph: UnsafeMutablePointer<RTGraph>, lanes: UnsafeMutablePointer<RTLaneNode>?, buses: UnsafeMutablePointer<RTBusNode>?) {
         var lanes: UnsafeMutablePointer<RTLaneNode>?
-        if !nodes.isEmpty {
-            let buffer = UnsafeMutablePointer<RTLaneNode>.allocate(capacity: nodes.count)
-            for (index, node) in nodes.enumerated() {
+        if !laneNodes.isEmpty {
+            let buffer = UnsafeMutablePointer<RTLaneNode>.allocate(capacity: laneNodes.count)
+            for (index, node) in laneNodes.enumerated() {
                 buffer.advanced(by: index).initialize(to: node)
             }
             lanes = buffer
         }
+        var buses: UnsafeMutablePointer<RTBusNode>?
+        if !busNodes.isEmpty {
+            let buffer = UnsafeMutablePointer<RTBusNode>.allocate(capacity: busNodes.count)
+            for (index, node) in busNodes.enumerated() {
+                buffer.advanced(by: index).initialize(to: node)
+            }
+            buses = buffer
+        }
         let graph = UnsafeMutablePointer<RTGraph>.allocate(capacity: 1)
         graph.initialize(to: RTGraph(
             generation: generation,
-            laneCount: nodes.count,
+            laneCount: laneNodes.count,
             lanes: lanes,
-            outputBufferIndex: outputBufferIndex,
-            outputChannelsInBuffer: outputChannelsInBuffer,
-            outputChannelOffset: outputChannelOffset,
+            buses: buses,
+            busCount: busNodes.count,
             effectSlots: effectSlots,
-            effectSlotCount: effectSlotCount,
-            masterEffects: masterEffectCount > 0 ? effectSlots?.advanced(by: masterEffectOffset) : nil,
-            masterEffectCount: masterEffectCount
+            effectSlotCount: effectSlotCount
         ))
-        return (graph, lanes)
+        return (graph, lanes, buses)
     }
 
     public static func destroyGraph(
         _ graph: UnsafeMutablePointer<RTGraph>,
         lanes: UnsafeMutablePointer<RTLaneNode>?,
-        laneCount: Int
+        laneCount: Int,
+        buses: UnsafeMutablePointer<RTBusNode>? = nil,
+        busCount: Int = 0
     ) {
         if let lanes, laneCount > 0 {
             lanes.deinitialize(count: laneCount)
             lanes.deallocate()
+        }
+        if let buses, busCount > 0 {
+            buses.deinitialize(count: busCount)
+            buses.deallocate()
         }
         // The slots themselves are trivial — an `Unmanaged` and two integers —
         // so freeing them releases nothing. The strong references live in

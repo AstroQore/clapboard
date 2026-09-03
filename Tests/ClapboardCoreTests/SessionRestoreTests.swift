@@ -24,9 +24,22 @@ struct SessionRestoreTests {
         let engine = AudioEngine()
         engine.restore(original)
         let snapshot = engine.sessionSnapshot
-        #expect(snapshot.lanes == original.lanes)
-        #expect(snapshot.outputDeviceUID == "the-output")
-        #expect(snapshot.masterGainDB == -6)
+        // A version 1 document carries no bus at all; restoring one assigns
+        // every lane to the Master bus `AudioEngine` creates for itself, so
+        // that is the one field the round trip legitimately adds.
+        let masterBusID = engine.buses.first?.id
+        let expectedLanes = original.lanes.map { lane -> LaneConfig in
+            var lane = lane
+            lane.destinationBus = masterBusID
+            return lane
+        }
+        #expect(snapshot.lanes == expectedLanes)
+        #expect(snapshot.formatVersion == 2)
+        // Format 2 carries the output device and the gain on the bus itself,
+        // not at the top level — that's what migration reads, not what a
+        // fresh save writes.
+        #expect(snapshot.buses.first?.outputDeviceUID == "the-output")
+        #expect(snapshot.buses.first?.gainDB == -6)
     }
 
     @Test func laneIdsAndOrderSurviveARestore() {

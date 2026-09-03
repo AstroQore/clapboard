@@ -16,10 +16,26 @@ public struct LaneConfig: Identifiable, Hashable, Sendable {
     public var deviceChannels: [Int]
     public var name: String
     public var gainDB: Float
-    public var enabled: Bool
+    /// The switch the `M` button and the global hotkeys drive.
+    ///
+    /// This replaced the older `enabled` flag when buses landed, because a
+    /// console strip mutes rather than switches off and solo has to be able to
+    /// silence a strip without touching what the user set. `enabled` is kept
+    /// as its inverse so existing call sites and session files keep working.
+    public var muted: Bool
+    /// Solo is scoped to the destination bus: soloing one lane silences the
+    /// other lanes feeding the same bus, and nothing else.
+    public var solo: Bool
     public var polarityInverted: Bool
     /// Integer samples at 48 kHz. M3 writes this from the clap measurement.
     public var delaySamples: Int
+    /// The bus this lane sums into.
+    ///
+    /// Optional only so a `LaneConfig` can be built — or decoded from a
+    /// version 1 session — before any bus exists. `AudioEngine` fills it in
+    /// with the `Master` bus the moment the lane is added, so a lane held by a
+    /// live engine always has one.
+    public var destinationBus: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -29,16 +45,27 @@ public struct LaneConfig: Identifiable, Hashable, Sendable {
         gainDB: Float = 0,
         enabled: Bool = true,
         polarityInverted: Bool = false,
-        delaySamples: Int = 0
+        delaySamples: Int = 0,
+        solo: Bool = false,
+        destinationBus: UUID? = nil
     ) {
         self.id = id
         self.deviceUID = deviceUID
         self.deviceChannels = Array(deviceChannels.prefix(2))
         self.name = name
         self.gainDB = gainDB
-        self.enabled = enabled
+        self.muted = !enabled
+        self.solo = solo
         self.polarityInverted = polarityInverted
         self.delaySamples = delaySamples
+        self.destinationBus = destinationBus
+    }
+
+    /// The inverse of `muted`, kept so the row-based mixer's toggle and every
+    /// session file written before buses existed keep working unchanged.
+    public var enabled: Bool {
+        get { !muted }
+        set { muted = !newValue }
     }
 
     public var isStereo: Bool { deviceChannels.count >= 2 }
@@ -86,7 +113,8 @@ public enum Decibels {
 /// plug-in state) stays attached to the same lane across relaunches.
 extension LaneConfig: Codable {
     private enum CodingKeys: String, CodingKey {
-        case id, deviceUID, deviceChannels, name, gainDB, enabled, polarityInverted, delaySamples
+        case id, deviceUID, deviceChannels, name, gainDB, enabled, muted, solo
+        case polarityInverted, delaySamples, destinationBus
     }
 
     public init(from decoder: any Decoder) throws {
@@ -100,9 +128,15 @@ extension LaneConfig: Codable {
             ),
             name: container.lenient(String.self, .name, deviceUID),
             gainDB: container.lenient(Float.self, .gainDB, 0),
-            enabled: container.lenient(Bool.self, .enabled, true),
+            // `muted` is what version 2 writes; `enabled` is what version 1
+            // wrote and what an older build still understands, so a file
+            // carrying only the old key migrates by itself.
+            enabled: container.lenientOptional(Bool.self, .muted).map { !$0 }
+                ?? container.lenient(Bool.self, .enabled, true),
             polarityInverted: container.lenient(Bool.self, .polarityInverted, false),
-            delaySamples: container.lenient(Int.self, .delaySamples, 0)
+            delaySamples: container.lenient(Int.self, .delaySamples, 0),
+            solo: container.lenient(Bool.self, .solo, false),
+            destinationBus: container.lenientOptional(UUID.self, .destinationBus)
         )
     }
 
@@ -113,9 +147,14 @@ extension LaneConfig: Codable {
         try container.encode(deviceChannels, forKey: .deviceChannels)
         try container.encode(name, forKey: .name)
         try container.encode(gainDB, forKey: .gainDB)
+        // Both spellings: `muted` is the truth, `enabled` keeps a Clapboard
+        // that predates buses able to read the file.
+        try container.encode(muted, forKey: .muted)
         try container.encode(enabled, forKey: .enabled)
+        try container.encode(solo, forKey: .solo)
         try container.encode(polarityInverted, forKey: .polarityInverted)
         try container.encode(delaySamples, forKey: .delaySamples)
+        try container.encodeIfPresent(destinationBus, forKey: .destinationBus)
     }
 
     /// A lane always drives at least one channel; negative indices and a third

@@ -40,12 +40,40 @@ yet.
   `coreaudiod` stuck with a dangling aggregate.
 - `Scripts/build_app.sh`: builds, bundles and ad-hoc (or identity-)signs
   `.build/Clapboard.app`.
+- **Bus routing** (`docs/ROUTING.md`): lanes route to a `BusConfig` instead of
+  summing straight into one master, buses can feed other buses, and any bus
+  can carry its own output device — several buses, several output devices,
+  one private aggregate carrying all of them
+  (`AggregateDeviceRequest.outputDeviceUIDs`). `RoutingGraph` validates the
+  tree and rejects cycles; `SoloLogic` scopes solo to a lane's bus or a bus's
+  siblings; `LatencyPlan` runs plug-in delay compensation across the whole
+  tree, not just per lane. The real-time render kernel gives every bus its
+  own persistent accumulator, gain smoother, meter and PDC delay line, and
+  renders the tree children-before-parents. Session format 2 adds `buses:
+  [BusConfig]` and a version 1 file migrates its implicit master into an
+  explicit `Master` bus on restore. New `AudioEngine` API: `addBus`/
+  `removeBus`/`renameBus`/`setBusGainDB`/`setBusMuted`/`setBusSolo`/
+  `setBusDestination`/`setBusOutput`, `setLaneDestination`/`setLaneMuted`/
+  `setLaneSolo`, `muteAllLanes`/`unmuteAllLanes`/`toggleAllLanes`,
+  `busMeter`/`busChainLatency`/`outputLatencySamples(forDevice:)`.
+  `setOutputDevice`/`masterGainDB`/`masterEffects`/`masterMeter` keep working
+  unchanged as thin shims onto the Master bus. New headless flags:
+  `--bus`/`--route`/`--bus-parent`/`--bus-output`/`--solo`/`--mute` on
+  `--engine-test`, and `--routing-selftest`, which builds a two-output-device
+  bus tree and checks it end to end.
 
 ### Known limitations
 
-- Bus routing, global hotkeys, a virtual-device driver, and process-tap
-  system-audio capture are planned but not implemented yet — see
-  `docs/ARCHITECTURE.md`.
+- No console UI for buses yet: the row-based mixer still runs against the
+  Master bus only, through the shims above. Routing is reachable today only
+  through the `AudioEngine` API and the headless flags.
+- Per-bus effect editing exists only for the Master bus; a chain saved on any
+  other bus round-trips through a session file but comes back as a
+  placeholder rather than a live plug-in (`docs/ROUTING.md`).
+- Projects (Save As / Open / Open Recent / a dirty-state title bar) are
+  designed in `docs/ROUTING.md` but not implemented.
+- Global hotkeys, a virtual-device driver, and process-tap system-audio
+  capture are planned but not implemented yet — see `docs/ARCHITECTURE.md`.
 - No signed/notarized release build exists; see `SECURITY.md`.
 
 [Unreleased]: https://github.com/AstroQore/clapboard/commits/main

@@ -10,9 +10,14 @@ public struct SessionRestoreReport: Sendable, Equatable {
     /// The file came from a newer Clapboard; anything this build does not
     /// understand was dropped from the lanes but kept in the extras bag.
     public var fromNewerFormat: Bool = false
-    /// Effects the file asked for. They are still loading when `restore`
-    /// returns — instantiating a plug-in is `async` and slow — so wait on
-    /// `AudioEngine.restoringEffects` before judging the result.
+    /// `true` when the file predated buses (`formatVersion < 2`, or a
+    /// version 2 file with no `buses` at all) and a `Master` bus was
+    /// synthesized from `outputDeviceUID`/`masterGainDB`/`masterExtras`.
+    public var migratedFromFormat1: Bool = false
+    /// Effects the file asked for, across every lane and every bus. They are
+    /// still loading when `restore` returns — instantiating a plug-in is
+    /// `async` and slow — so wait on `AudioEngine.restoringEffects` before
+    /// judging the result.
     public var pendingEffects: Int = 0
 
     public var summary: String {
@@ -20,6 +25,7 @@ public struct SessionRestoreReport: Sendable, Equatable {
         if !skippedLanes.isEmpty { parts.append("skipped \(skippedLanes.count)") }
         if restarted { parts.append("engine restarted") }
         if pendingEffects > 0 { parts.append("loading \(pendingEffects) effect(s)") }
+        if migratedFromFormat1 { parts.append("migrated from format 1") }
         if fromNewerFormat { parts.append("file is from a newer Clapboard") }
         return parts.joined(separator: ", ")
     }
@@ -29,7 +35,12 @@ extension AudioEngine {
     /// The part of the engine's state that belongs in the session file.
     ///
     /// Meters, run state, overload counts and the aggregate device are all
-    /// derived or per-run and deliberately absent.
+    /// derived or per-run and deliberately absent. `outputDeviceUID`/
+    /// `masterGainDB`/`masterExtras` are written empty/default: `buses`
+    /// carries that information now, one entry per bus, each with its own
+    /// chain inline — they are kept in the document only so a version 1
+    /// reader (or this build reading its own file back after a downgrade)
+    /// still finds something familiar.
     public var sessionSnapshot: SessionDocument {
         var laneBags: [String: [String: Data]] = [:]
         for lane in lanes {
@@ -37,17 +48,15 @@ extension AudioEngine {
             guard let data = try? EffectChainCodec.encode(savedChain(chain)) else { continue }
             laneBags[lane.id.uuidString] = [EffectChainCodec.extrasKey: data]
         }
-        var masterBag: [String: Data] = [:]
-        if !masterEffects.isEmpty,
-           let data = try? EffectChainCodec.encode(savedChain(masterEffects)) {
-            masterBag[EffectChainCodec.extrasKey] = data
+        let savedBuses = buses.map { bus -> BusConfig in
+            var bus = bus
+            bus.effects = savedChain(bus.effects)
+            return bus
         }
         return SessionDocument(
             lanes: lanes,
-            outputDeviceUID: outputDeviceUID,
-            masterGainDB: masterGainDB,
-            laneExtras: laneBags,
-            masterExtras: masterBag
+            buses: savedBuses,
+            laneExtras: laneBags
         )
     }
 
@@ -90,16 +99,22 @@ extension AudioEngine {
         clearAllEffects()
 
         for id in lanes.map(\.id) { removeLane(id: id) }
-        setOutputDevice(uid: session.outputDeviceUID)
-        masterGainDB = AudioEngine.clampedGainDB(session.masterGainDB)
+        // Mute-all's memory is meaningless once the mixer underneath it has
+        // been replaced wholesale.
+        mutedLanesRemembered = []
 
+        report.migratedFromFormat1 = session.needsBusMigration
+        replaceBuses(AudioEngine.migratedBuses(from: session))
+        rebuildRoutingGraph()
+
+        let outputUIDs = Set(buses.compactMap(\.outputDeviceUID))
         var usedIDs = Set<UUID>()
         for lane in session.lanes {
-            // A lane on the output device would feed the mix back into itself;
-            // `setOutputDevice` drops such lanes, and a hand-edited file must
-            // not be able to sneak one past it.
-            guard lane.deviceUID != session.outputDeviceUID else {
-                report.skippedLanes.append("\(lane.name): its device is the output device")
+            // A lane on any output device would feed the mix back into
+            // itself; `setBusOutput` drops such a lane going forward, and a
+            // hand-edited file must not be able to sneak one past it either.
+            guard !outputUIDs.contains(lane.deviceUID) else {
+                report.skippedLanes.append("\(lane.name): its device is an output device")
                 continue
             }
             // Duplicated ids in an edited file would make two lanes share one
@@ -112,27 +127,38 @@ extension AudioEngine {
             report.restoredLanes += 1
         }
 
-        // Chains are attached after the lanes, keyed by the lane ids that
-        // just came back — which is exactly why `LaneConfig.id` is persisted.
-        var wanted: [(laneID: UUID?, chain: [EffectConfig])] = []
+        // Chains are attached after the lanes and buses, keyed by whichever
+        // id just came back — which is exactly why `LaneConfig.id`/
+        // `BusConfig.id` are persisted.
+        var wantedLaneEffects: [(laneID: UUID, chain: [EffectConfig])] = []
         for lane in lanes {
             let chain = EffectChainCodec.decode(
                 session.laneExtras[lane.id.uuidString]?[EffectChainCodec.extrasKey])
-            if !chain.isEmpty { wanted.append((lane.id, chain)) }
+            if !chain.isEmpty { wantedLaneEffects.append((lane.id, chain)) }
         }
-        let master = EffectChainCodec.decode(session.masterExtras[EffectChainCodec.extrasKey])
-        if !master.isEmpty { wanted.append((nil, master)) }
-        report.pendingEffects = wanted.reduce(0) { $0 + $1.chain.count }
+        // A version 1 file's master chain travels in `masterExtras`, already
+        // folded into the synthesized bus's `effects` by `migratedBuses`; a
+        // version 2 file already carries it there directly. Either way it is
+        // sitting in `buses[_].effects` right now — take it out and load it
+        // the same way a lane's chain loads, then clear the field so
+        // `republishGraph()` does not see stale, uninstantiated ids.
+        var wantedBusEffects: [(busID: UUID, chain: [EffectConfig])] = []
+        for index in buses.indices where !buses[index].effects.isEmpty {
+            wantedBusEffects.append((buses[index].id, buses[index].effects))
+            buses[index].effects = []
+        }
+        report.pendingEffects = wantedLaneEffects.reduce(0) { $0 + $1.chain.count }
+            + wantedBusEffects.reduce(0) { $0 + $1.chain.count }
 
         if wasRunning {
             start()
             report.restarted = true
         }
 
-        if !wanted.isEmpty {
+        if !wantedLaneEffects.isEmpty || !wantedBusEffects.isEmpty {
             restoringEffects = true
             effectRestoreTask = Task { @MainActor [weak self] in
-                await self?.loadRestoredChains(wanted)
+                await self?.loadRestoredChains(lanes: wantedLaneEffects, buses: wantedBusEffects)
             }
         }
         return report
@@ -144,19 +170,46 @@ extension AudioEngine {
         await effectRestoreTask?.value
     }
 
-    /// Loads each saved chain in order, one plug-in at a time.
+    /// Loads every saved chain in order, one plug-in at a time — lanes first,
+    /// then buses, master included.
     ///
     /// Sequential on purpose: instantiating several AUv2 bundles at once means
     /// several plug-ins touching AppKit from the same actor, and the order of
     /// a chain is part of its sound, so there is nothing to gain from racing.
-    private func loadRestoredChains(_ wanted: [(laneID: UUID?, chain: [EffectConfig])]) async {
+    private func loadRestoredChains(
+        lanes wantedLanes: [(laneID: UUID, chain: [EffectConfig])],
+        buses wantedBuses: [(busID: UUID, chain: [EffectConfig])]
+    ) async {
         defer { restoringEffects = false }
-        for entry in wanted {
+        for entry in wantedLanes {
             for config in entry.chain {
                 if Task.isCancelled { return }
                 // The lane can be removed while an earlier plug-in loads.
-                if let laneID = entry.laneID, lane(id: laneID) == nil { break }
+                if lane(id: entry.laneID) == nil { break }
                 await restoreOne(config, intoLane: entry.laneID)
+            }
+        }
+        for entry in wantedBuses {
+            for config in entry.chain {
+                if Task.isCancelled { return }
+                guard bus(id: entry.busID) != nil else { break }
+                if entry.busID == masterBusID {
+                    // The master bus is `buses[_]` too, but this is the path
+                    // that already exists, is already tested, and already
+                    // keeps `masterEffects` (the shim) correct.
+                    await restoreOne(config, intoLane: nil)
+                } else {
+                    // Per-bus effect editing has no UI or engine API yet
+                    // (only the master bus's chain is ever edited today), so
+                    // a saved chain on any other bus is kept as a
+                    // placeholder — its state survives the round trip
+                    // unharmed, it is simply not live — rather than
+                    // instantiating a plug-in nothing can ever reach again.
+                    var placeholder = config
+                    placeholder.unavailableReason =
+                        "Per-bus effect chains cannot be edited yet; the saved state is kept."
+                    mutateBus(entry.busID) { $0.effects.append(placeholder) }
+                }
             }
         }
     }
@@ -204,13 +257,56 @@ extension AudioEngine {
         for chain in laneEffects.values {
             for config in chain { host.discardEffect(id: config.id) }
         }
-        for config in masterEffects { host.discardEffect(id: config.id) }
+        for bus in buses {
+            for config in bus.effects { host.discardEffect(id: config.id) }
+        }
         laneEffects.removeAll()
-        masterEffects.removeAll()
+        for index in buses.indices { buses[index].effects = [] }
         pdcSamples.removeAll()
         pdcWarning = nil
         republishGraph()
         drainRetiredEffects()
+    }
+
+    /// Replaces `buses` wholesale — discarding every existing bus's runtime
+    /// and registered effects, the same "replace, don't merge" rule `restore`
+    /// applies to lanes — and points `masterBusID` at whichever bus in the
+    /// new set is `Master`, so `masterGainDB`/`masterEffects`/`masterMeter`/
+    /// `setOutputDevice` keep working against the bus the file actually
+    /// calls Master. `newBuses` is never empty: `migratedBuses(from:)`
+    /// guarantees at least one.
+    private func replaceBuses(_ newBuses: [BusConfig]) {
+        for bus in buses {
+            for config in bus.effects { host.discardEffect(id: config.id) }
+            host.discardBusRuntime(for: bus.id)
+        }
+        buses = []
+        for bus in newBuses {
+            host.runtime(forBus: bus.id)
+            buses.append(bus)
+        }
+        masterBusID = newBuses.first(where: { $0.name == BusConfig.masterName })?.id
+            ?? newBuses[0].id
+    }
+
+    /// `session.buses` when the file already has one (version 2), or a
+    /// freshly synthesized `Master` bus from the version 1 fields
+    /// (`outputDeviceUID`, `masterGainDB`, `masterExtras`) — every lane is
+    /// routed to it the moment it is restored (`addLane` assigns any lane
+    /// without a known `destinationBus` to `masterBusID`), which is exactly
+    /// "migrate the implicit master into an explicit bus, route everything
+    /// at it" (`docs/ROUTING.md`).
+    static func migratedBuses(from session: SessionDocument) -> [BusConfig] {
+        guard !session.needsBusMigration else {
+            let effects = EffectChainCodec.decode(session.masterExtras[EffectChainCodec.extrasKey])
+            return [BusConfig(
+                name: BusConfig.masterName,
+                gainDB: clampedGainDB(session.masterGainDB),
+                effects: effects,
+                outputDeviceUID: session.outputDeviceUID
+            )]
+        }
+        return session.buses.map(sanitized(_:))
     }
 
     /// Values from a file are not values from the UI: clamp them to what the
@@ -224,8 +320,17 @@ extension AudioEngine {
             gainDB: clampedGainDB(lane.gainDB),
             enabled: lane.enabled,
             polarityInverted: lane.polarityInverted,
-            delaySamples: min(max(0, lane.delaySamples), RTLimits.maxDelaySamples)
+            delaySamples: min(max(0, lane.delaySamples), RTLimits.maxDelaySamples),
+            solo: lane.solo,
+            destinationBus: lane.destinationBus
         )
+    }
+
+    private static func sanitized(_ bus: BusConfig) -> BusConfig {
+        var bus = bus
+        bus.gainDB = clampedGainDB(bus.gainDB)
+        bus.outputChannelOffset = max(0, bus.outputChannelOffset)
+        return bus
     }
 
     private static func clampedGainDB(_ db: Float) -> Float {

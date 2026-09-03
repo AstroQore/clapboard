@@ -23,6 +23,11 @@ enum SessionSmokeTest {
         var autosave = false
         var runSeconds = 3.0
         var ignoreTCC = false
+        // `--restore-session ... --save-session` writes what came back —
+        // migrated to the current format — to `--session-path` (the default
+        // store if that is absent), the same "prove the round trip" pattern
+        // `--engine-test --save-session` already uses.
+        var saveAfterRestore = false
 
         var index = 0
         while index < arguments.count {
@@ -36,6 +41,7 @@ enum SessionSmokeTest {
             case "--session-path": sessionPath = next()
             case "--session-dump": dump = true
             case "--session-autosave-test": autosave = true
+            case "--save-session": saveAfterRestore = true
             case "--run": runSeconds = Double(next() ?? "3") ?? 3
             case "--ignore-tcc": ignoreTCC = true
             default: break
@@ -52,7 +58,9 @@ enum SessionSmokeTest {
         guard let restorePath else {
             fail("--restore-session needs a file")
         }
-        restoreAndExit(path: restorePath, runSeconds: runSeconds, ignoreTCC: ignoreTCC)
+        restoreAndExit(
+            path: restorePath, runSeconds: runSeconds, ignoreTCC: ignoreTCC,
+            saveAfterRestore: saveAfterRestore, savePath: sessionPath)
     }
 
     /// Shared with `--engine-test --save-session`. `nil` only when macOS
@@ -146,7 +154,10 @@ enum SessionSmokeTest {
     // MARK: - Restore
 
     @MainActor
-    private static func restoreAndExit(path: String, runSeconds: Double, ignoreTCC: Bool) -> Never {
+    private static func restoreAndExit(
+        path: String, runSeconds: Double, ignoreTCC: Bool,
+        saveAfterRestore: Bool, savePath: String?
+    ) -> Never {
         let store = SessionStore(fileURL: URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
         say("file     \(store.fileURL.path)")
         let document: SessionDocument
@@ -186,11 +197,31 @@ enum SessionSmokeTest {
                 sayEffect(effect, on: "lane", engine: engine)
             }
         }
-        for effect in engine.masterEffects { sayEffect(effect, on: "master", engine: engine) }
-        if !engine.laneEffects.isEmpty || !engine.masterEffects.isEmpty {
-            say("latency  out=\(engine.outputLatencySamples) sp "
-                + String(format: "(%.2f ms)", engine.outputLatencyMilliseconds)
-                + engine.lanes.map { " \(short($0.name)) pdc=+\(engine.pdcSamples[$0.id] ?? 0)sp" }.joined())
+        for bus in engine.buses {
+            say("bus      \(bus.name) [\(bus.id)] "
+                + String(format: "gain=%.1fdB ", bus.gainDB)
+                + "muted=\(bus.muted) solo=\(bus.solo) "
+                + "parent=\(bus.destinationBus.map { id in engine.bus(id: id)?.name ?? id.uuidString } ?? "-") "
+                + "output=\(bus.outputDeviceUID.map { describeDevice($0, registry: registry) } ?? "-")")
+            for effect in bus.effects { sayEffect(effect, on: bus.name, engine: engine) }
+        }
+        if !engine.laneEffects.isEmpty || engine.buses.contains(where: { !$0.effects.isEmpty }) {
+            say("latency  " + EngineSmokeTest.busPDCLine(engine))
+            say("         " + EngineSmokeTest.outputLatencyLine(engine))
+            say("         " + engine.lanes.map { " \(short($0.name)) pdc=+\(engine.pdcSamples[$0.id] ?? 0)sp" }.joined())
+        }
+
+        if saveAfterRestore {
+            guard let destination = SessionSmokeTest.store(path: savePath) else {
+                fail("macOS reports no Application Support directory; pass --session-path")
+            }
+            do {
+                try destination.save(engine.sessionSnapshot)
+                say("session  wrote format \(engine.sessionSnapshot.formatVersion) "
+                    + "(\(engine.lanes.count) lane(s), \(engine.buses.count) bus(es)) to \(destination.fileURL.path)")
+            } catch {
+                fail("could not write the session: \(error)")
+            }
         }
 
         guard runSeconds > 0 else { exit(0) }
@@ -224,17 +255,36 @@ enum SessionSmokeTest {
             ))
         }
 
-        // The session must survive a restore → run round trip unchanged, which
-        // is the whole point of keeping missing-device lanes.
+        // The session must survive a restore → run round trip unchanged,
+        // which is the whole point of keeping missing-device lanes. A
+        // version 1 file's implicit master migrates into an explicit bus, so
+        // lanes are compared ignoring `destinationBus` (a v1 file never had
+        // one) and the master's own fields are compared wherever they
+        // actually live in each document — top level for v1, on its bus for
+        // v2 — rather than assuming both are shaped the same way.
         let after = engine.sessionSnapshot
-        let sameLanes = after.lanes == document.lanes
-        let sameOutput = after.outputDeviceUID == document.outputDeviceUID
+        func stripDestination(_ lanes: [LaneConfig]) -> [LaneConfig] {
+            lanes.map { lane in
+                var lane = lane
+                lane.destinationBus = nil
+                return lane
+            }
+        }
+        let sameLanes = stripDestination(after.lanes) == stripDestination(document.lanes)
+        let documentMaster = document.needsBusMigration
+            ? nil
+            : document.buses.first { $0.name == BusConfig.masterName }
+        let expectedOutput = document.needsBusMigration ? document.outputDeviceUID : documentMaster?.outputDeviceUID
+        let expectedGain = document.needsBusMigration ? document.masterGainDB : (documentMaster?.gainDB ?? 0)
+        let afterMaster = after.buses.first { $0.name == BusConfig.masterName }
+        let sameOutput = afterMaster?.outputDeviceUID == expectedOutput
+        let sameMasterGain = afterMaster?.gainDB == expectedGain
         // Effect ids have to survive: everything keyed on them — the chain
         // order, each plug-in's saved state — hangs off that.
         let before = chainIdentities(document)
         let now = chainIdentities(after)
         let sameChains = before == now
-        say("stable   lanes=\(sameLanes) output=\(sameOutput) master=\(after.masterGainDB == document.masterGainDB) "
+        say("stable   lanes=\(sameLanes) output=\(sameOutput) master=\(sameMasterGain) "
             + "chains=\(sameChains) (\(before.count) effect(s))")
 
         engine.shutdown()
@@ -242,7 +292,7 @@ enum SessionSmokeTest {
         let leftovers = ((try? AudioDeviceInfo.enumerateAll()) ?? [])
             .filter { $0.uid.hasPrefix("com.astroqore.Clapboard.aggregate.") || $0.name == "Clapboard Mix" }
         say("leftover aggregates after shutdown: \(leftovers.count)")
-        exit(leftovers.isEmpty && sameLanes && sameOutput && sameChains ? 0 : 2)
+        exit(leftovers.isEmpty && sameLanes && sameOutput && sameMasterGain && sameChains ? 0 : 2)
     }
 
     // MARK: - Helpers
@@ -266,25 +316,49 @@ enum SessionSmokeTest {
             + "state=\(effect.isAvailable ? "loaded" : "UNAVAILABLE: \(effect.unavailableReason ?? "")")")
     }
 
-    /// `(id, componentID, bypass)` for every effect in a document, master last.
+    /// `(id, componentID, bypass)` for every effect in a document, keyed by
+    /// the lane id or, for a bus, its *name* rather than its id — a version 1
+    /// document's implicit master and its migrated bus never share an id,
+    /// but they do share the name `Master`, which is what lets this compare
+    /// meaningfully across the migration.
     private static func chainIdentities(_ document: SessionDocument) -> [String] {
         var result: [String] = []
         for lane in document.lanes {
             let chain = EffectChainCodec.decode(
                 document.laneExtras[lane.id.uuidString]?[EffectChainCodec.extrasKey])
-            result += chain.map { "\(lane.id):\($0.id):\($0.componentID):\($0.bypass)" }
+            result += chain.map { "lane:\(lane.id):\($0.id):\($0.componentID):\($0.bypass)" }
         }
-        result += EffectChainCodec
-            .decode(document.masterExtras[EffectChainCodec.extrasKey])
-            .map { "master:\($0.id):\($0.componentID):\($0.bypass)" }
+        if document.needsBusMigration {
+            result += EffectChainCodec
+                .decode(document.masterExtras[EffectChainCodec.extrasKey])
+                .map { "bus:\(BusConfig.masterName):\($0.id):\($0.componentID):\($0.bypass)" }
+        } else {
+            for bus in document.buses {
+                result += bus.effects.map { "bus:\(bus.name):\($0.id):\($0.componentID):\($0.bypass)" }
+            }
+        }
         return result
     }
 
     private static func describe(_ document: SessionDocument) {
         say("format   \(document.formatVersion)\(document.isFromNewerFormat ? " (NEWER than this build understands)" : "")")
         say("savedAt  \(ISO8601DateFormatter().string(from: document.savedAt))")
-        say("lanes    \(document.lanes.count)  output=\(document.outputDeviceUID ?? "-")  "
-            + String(format: "master=%.1f dB", document.masterGainDB))
+        say("lanes    \(document.lanes.count)")
+        if document.needsBusMigration {
+            say("buses    0 — version 1 file, migrates to one Master bus on restore: "
+                + "output=\(document.outputDeviceUID ?? "-") "
+                + String(format: "gain=%.1f dB", document.masterGainDB))
+        } else {
+            say("buses    \(document.buses.count)")
+            for bus in document.buses {
+                say("bus      \(bus.name) [\(bus.id)] "
+                    + String(format: "gain=%.1fdB ", bus.gainDB)
+                    + "muted=\(bus.muted) solo=\(bus.solo) "
+                    + "parent=\(bus.destinationBus?.uuidString ?? "-") "
+                    + "output=\(bus.outputDeviceUID ?? "-")"
+                    + (bus.effects.isEmpty ? "" : " effects=\(bus.effects.count)"))
+            }
+        }
         let chains = chainIdentities(document)
         if !chains.isEmpty {
             say("effects  \(chains.count) in the file: \(chains.joined(separator: " "))")

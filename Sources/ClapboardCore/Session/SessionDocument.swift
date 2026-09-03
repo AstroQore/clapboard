@@ -18,34 +18,43 @@ public struct SessionDocument: Codable, Sendable, Equatable {
     /// Bumped only when a reader has to behave differently, not on every
     /// additive field: adding a key that older builds ignore is exactly what
     /// the tolerant decoding above is for.
-    public static let currentFormatVersion = 1
+    ///
+    /// Version 2 (`docs/ROUTING.md`) adds `buses` and moves routing onto each
+    /// lane's `destinationBus`. A version 1 reader still opens a version 2
+    /// file — it just ignores `buses` and every lane's `destinationBus` and
+    /// sees one flat mix, which is a worse mix, not a wrong one.
+    public static let currentFormatVersion = 2
 
     public var formatVersion: Int
     /// Lane order is part of the session — it is the order the UI shows and
     /// the order the aggregate device lists its sub-devices in.
     public var lanes: [LaneConfig]
-    /// Kept even when the device is not plugged in right now. The engine
-    /// reports such a lane as `deviceMissing` and rebinds it when it returns.
+    /// Every bus, each carrying its own chain inline (`BusConfig.effects`).
+    /// Empty in a version 1 file — `AudioEngine.restore` migrates one from
+    /// `outputDeviceUID`/`masterGainDB`/`masterExtras` in that case.
+    public var buses: [BusConfig]
+    /// Version 1 only: the single implicit master's output device and gain.
+    /// A version 2 file carries these on `buses` instead; this is read for
+    /// migration and otherwise ignored once `buses` is non-empty.
     public var outputDeviceUID: String?
     public var masterGainDB: Float
     /// Whole seconds, so the ISO-8601 form in the file round-trips exactly.
     public var savedAt: Date
 
-    /// Forward-compatible bag for per-lane state this version does not model,
-    /// keyed by `LaneConfig.id.uuidString` and then by an owner-chosen name.
-    ///
-    /// M4's per-lane effect chains are meant to land here as one entry holding
-    /// an `AUAudioUnit.fullState` binary plist. Nothing in M5 writes it; it
-    /// exists so that a build which does write it cannot have its settings
-    /// silently erased by an older build, which loads the bag, leaves it alone
-    /// and saves it back out.
+    /// Forward-compatible bag for per-lane state a lane doesn't carry inline
+    /// — a `LaneConfig` has no `effects` field of its own, so a lane's Audio
+    /// Unit chain lives here, keyed by `LaneConfig.id.uuidString` and then by
+    /// an owner-chosen name (`EffectChainCodec.extrasKey`).
     public var laneExtras: [String: [String: Data]]
-    /// The same, for the master bus.
+    /// Version 1 only: the single implicit master's chain. A version 2 file
+    /// carries every bus's chain on `BusConfig.effects` instead; this is read
+    /// for migration and otherwise written empty.
     public var masterExtras: [String: Data]
 
     public init(
         formatVersion: Int = SessionDocument.currentFormatVersion,
         lanes: [LaneConfig] = [],
+        buses: [BusConfig] = [],
         outputDeviceUID: String? = nil,
         masterGainDB: Float = 0,
         savedAt: Date = Date(),
@@ -54,12 +63,20 @@ public struct SessionDocument: Codable, Sendable, Equatable {
     ) {
         self.formatVersion = formatVersion
         self.lanes = lanes
+        self.buses = buses
         self.outputDeviceUID = outputDeviceUID
         self.masterGainDB = masterGainDB
         self.savedAt = SessionDocument.wholeSeconds(savedAt)
         self.laneExtras = laneExtras
         self.masterExtras = masterExtras
     }
+
+    /// True for a file with no buses at all — a genuine version 1 document,
+    /// or a hand-edited version 2 one missing the key. Either way,
+    /// `AudioEngine.restore` synthesizes a `Master` bus from
+    /// `outputDeviceUID`/`masterGainDB`/`masterExtras` rather than ending up
+    /// with a mixer that has none.
+    public var needsBusMigration: Bool { buses.isEmpty }
 
     /// True when the file was written by a Clapboard that knows more than this
     /// one. Everything this build understands has still been loaded; callers
@@ -75,15 +92,17 @@ public struct SessionDocument: Codable, Sendable, Equatable {
     // MARK: - Coding
 
     private enum CodingKeys: String, CodingKey {
-        case formatVersion, lanes, outputDeviceUID, masterGainDB, savedAt, laneExtras, masterExtras
+        case formatVersion, lanes, buses, outputDeviceUID, masterGainDB, savedAt, laneExtras, masterExtras
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let lanes = container.lenientOptional([LenientlyDecoded<LaneConfig>].self, .lanes) ?? []
+        let buses = container.lenientOptional([LenientlyDecoded<BusConfig>].self, .buses) ?? []
         self.init(
             formatVersion: container.lenient(Int.self, .formatVersion, SessionDocument.currentFormatVersion),
             lanes: lanes.compactMap(\.value),
+            buses: buses.compactMap(\.value),
             outputDeviceUID: container.lenientOptional(String.self, .outputDeviceUID),
             masterGainDB: container.lenient(Float.self, .masterGainDB, 0),
             savedAt: container.lenient(Date.self, .savedAt, Date(timeIntervalSince1970: 0)),
