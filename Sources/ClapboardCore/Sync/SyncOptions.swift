@@ -15,6 +15,19 @@ public struct SyncOptions: Sendable, Equatable {
     /// a transient.
     public var minOnsetSNRdB: Double
 
+    /// How far the loudest 1 ms window must stand above the *median* 1 ms
+    /// window of the whole take before it is called a clap.
+    ///
+    /// This is the gate that separates a clap from a room: speech, a chair and
+    /// a door are all 10–15 dB above the floor and so is half of a busy room's
+    /// noise, but only a clap is 20 dB louder than everything else in the take.
+    public var minDominanceDB: Double
+
+    /// How far below the peak the attack search walks back to find the onset.
+    /// The onset is the first frame after the last one still `riseDB` under
+    /// the peak.
+    public var riseDB: Double
+
     /// Main correlation peak divided by the strongest competing peak. Below
     /// this the match is called ambiguous and the lane is left alone.
     public var minPeakRatio: Double
@@ -72,6 +85,8 @@ public struct SyncOptions: Sendable, Equatable {
     public init(
         maxLagSeconds: Double = 0.25,
         minOnsetSNRdB: Double = 12,
+        minDominanceDB: Double = 20,
+        riseDB: Double = 20,
         minPeakRatio: Double = 3.0,
         analysisWindowSeconds: Double = 0.02,
         preRollSeconds: Double = 0.005,
@@ -88,6 +103,8 @@ public struct SyncOptions: Sendable, Equatable {
     ) {
         self.maxLagSeconds = maxLagSeconds
         self.minOnsetSNRdB = minOnsetSNRdB
+        self.minDominanceDB = minDominanceDB
+        self.riseDB = riseDB
         self.minPeakRatio = minPeakRatio
         self.analysisWindowSeconds = analysisWindowSeconds
         self.preRollSeconds = preRollSeconds

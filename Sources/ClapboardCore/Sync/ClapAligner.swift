@@ -5,14 +5,18 @@ import Foundation
 ///
 /// The pipeline, per take:
 ///
-/// 1. **Onset** — a 1 ms RMS envelope per lane, a noise floor from the first
-///    `noiseFloorSeconds`, and the first steep frame that clears
-///    `minOnsetSNRdB` (`OnsetDetector`).
+/// 1. **Onset** — a 1 ms RMS envelope per lane and its single loudest frame,
+///    accepted only when it stands `minDominanceDB` above the median of that
+///    envelope and `minOnsetSNRdB` above the head noise floor
+///    (`OnsetDetector`).
 /// 2. **Reference** — the non-virtual lane that explains the most other lanes.
 ///    The strongest onsets are tried in turn and the candidate that aligns the
-///    most lanes wins, so a lane that caught an unrelated bang cannot take the
-///    take hostage. Virtual devices are measured but never lead, because their
-///    timeline is somebody else's clock.
+///    most *other* lanes wins, so a lane that caught an unrelated bang cannot
+///    take the take hostage. A candidate nobody matched is not a reference at
+///    all: the take then fails with `SyncResult.failureSummary` rather than
+///    showing one confident lane and no measurement. Virtual devices are
+///    measured but never lead, because their timeline is somebody else's
+///    clock.
 /// 3. **Windows** — `analysisWindowSeconds` starting `preRollSeconds` before
 ///    each lane's own onset, mean-removed, RMS-normalised, and tapered with an
 ///    exponential anchored at the onset so late reflections weigh less.
@@ -81,10 +85,14 @@ public struct ClapAligner: Sendable {
                     onsetSNRdB: preparation?.onset.onsetSNRdB,
                     clipped: preparation?.clipped ?? false,
                     suggestedDelaySamples: nil,
-                    suggestedDelayMs: nil
+                    suggestedDelayMs: nil,
+                    levels: preparation.flatMap { LaneLevels($0.onset) }
                 )
             }
-            return SyncResult(referenceLaneID: nil, lanes: results, sampleRate: sampleRate)
+            return SyncResult(
+                referenceLaneID: nil, lanes: results, sampleRate: sampleRate,
+                failureSummary: SyncResult.noClapFailureSummary
+            )
         }
 
         let windowLength = max(16, Int(options.analysisWindowSeconds * sampleRate))
@@ -97,7 +105,10 @@ public struct ClapAligner: Sendable {
                     suggestedDelaySamples: nil, suggestedDelayMs: nil
                 )
             }
-            return SyncResult(referenceLaneID: nil, lanes: results, sampleRate: sampleRate)
+            return SyncResult(
+                referenceLaneID: nil, lanes: results, sampleRate: sampleRate,
+                failureSummary: "Auto Sync could not start its analyser."
+            )
         }
 
         var bestReference = candidates[candidates.startIndex]
@@ -129,7 +140,10 @@ public struct ClapAligner: Sendable {
                     isReference: lane.laneID == candidate.recording.laneID,
                     sampleRate: sampleRate
                 )
-                if status.isAligned { score += 1 }
+                // Only *other* lanes count: a reference is always aligned
+                // with itself, and that is exactly the tautology that used to
+                // let a take with no clap show one confident lane.
+                if status.isAligned, lane.laneID != candidate.recording.laneID { score += 1 }
                 statuses[lane.laneID] = status
             }
             if score > bestScore {
@@ -139,6 +153,19 @@ public struct ClapAligner: Sendable {
             }
         }
         let reference = bestReference
+
+        // Nobody matched the best candidate, so there is no common clap: two
+        // lanes have to agree before anything may be written to a delay line.
+        guard bestScore > 0 else {
+            return failed(
+                lanes: lanes,
+                wouldBeReferenceID: reference.recording.laneID,
+                statuses: bestStatuses,
+                preparations: preparations,
+                sampleRate: sampleRate
+            )
+        }
+
         let statuses = normalisePolarity(bestStatuses)
 
         return assemble(
@@ -150,11 +177,49 @@ public struct ClapAligner: Sendable {
         )
     }
 
+    /// The take produced no reference: every lane is `notDetected` and no
+    /// delay is suggested, so the sheet can say so and keep Apply switched off.
+    private func failed(
+        lanes: [LaneRecording],
+        wouldBeReferenceID: UUID,
+        statuses: [UUID: LaneSyncStatus],
+        preparations: [UUID: LanePreparation],
+        sampleRate: Double
+    ) -> SyncResult {
+        let results = lanes.map { lane -> LaneSyncResult in
+            let preparation = preparations[lane.laneID]
+            let reason: String
+            if lane.laneID == wouldBeReferenceID {
+                reason = "no other lane matched this clap"
+            } else {
+                reason = statuses[lane.laneID]?.notDetectedReason
+                    ?? preparation?.failureReason
+                    ?? "no other lane matched this clap"
+            }
+            return LaneSyncResult(
+                laneID: lane.laneID,
+                label: lane.label,
+                status: .notDetected(reason: reason),
+                onsetSample: preparation?.onset.onsetSample,
+                onsetSNRdB: preparation?.onset.onsetSNRdB,
+                clipped: preparation?.clipped ?? false,
+                suggestedDelaySamples: nil,
+                suggestedDelayMs: nil,
+                levels: preparation.flatMap { LaneLevels($0.onset) }
+            )
+        }
+        return SyncResult(
+            referenceLaneID: nil, lanes: results, sampleRate: sampleRate,
+            failureSummary: SyncResult.noClapFailureSummary
+        )
+    }
+
     // MARK: - Several takes
 
     /// Combines several claps into one verdict per lane.
     ///
-    /// Each take is analysed on its own, the per-take offsets are re-expressed
+    /// Each take is analysed on its own — so each take has already had to find
+    /// the same clap on two lanes — the per-take offsets are re-expressed
     /// against a lane that was found in as many takes as possible, and the
     /// median across takes is kept. A lane is only `aligned` when at least two
     /// takes agree to within `multiTakeAgreementSeconds` (one take is enough
@@ -202,21 +267,32 @@ public struct ClapAligner: Sendable {
 
         guard let anchor else {
             let lanes = order.map { laneID in
-                LaneSyncResult(
+                let seen = results.compactMap { $0[laneID] }
+                return LaneSyncResult(
                     laneID: laneID,
                     label: labels[laneID] ?? "",
-                    status: .notDetected(reason: "no reference lane heard the clap"),
-                    onsetSample: nil, onsetSNRdB: nil, clipped: false,
-                    suggestedDelaySamples: nil, suggestedDelayMs: nil
+                    status: .notDetected(
+                        reason: seen.first?.status.notDetectedReason
+                            ?? "no other lane matched this clap"
+                    ),
+                    onsetSample: seen.first?.onsetSample,
+                    onsetSNRdB: seen.first?.onsetSNRdB,
+                    clipped: seen.contains { $0.clipped },
+                    suggestedDelaySamples: nil, suggestedDelayMs: nil,
+                    levels: seen.first?.levels
                 )
             }
-            return SyncResult(referenceLaneID: nil, lanes: lanes, sampleRate: sampleRate)
+            return SyncResult(
+                referenceLaneID: nil, lanes: lanes, sampleRate: sampleRate,
+                failureSummary: SyncResult.noClapFailureSummary
+            )
         }
 
         let tolerance = options.multiTakeAgreementSeconds * sampleRate
         var statuses: [UUID: LaneSyncStatus] = [:]
         var onsetSamples: [UUID: Int] = [:]
         var onsetSNRs: [UUID: Double] = [:]
+        var levels: [UUID: LaneLevels] = [:]
         var clipped: Set<UUID> = []
 
         for laneID in order {
@@ -236,6 +312,7 @@ public struct ClapAligner: Sendable {
                     onsetSamples[laneID] = onset
                     onsetSNRs[laneID] = lane.onsetSNRdB
                 }
+                if levels[laneID] == nil { levels[laneID] = lane.levels }
                 guard case let .aligned(offset, confidence, ratio, inverted) = lane.status else {
                     if let reason = lane.status.notDetectedReason { reasons.append(reason) }
                     continue
@@ -276,6 +353,33 @@ public struct ClapAligner: Sendable {
             )
         }
 
+        // The anchor is aligned with itself by construction. If the takes
+        // agreed about nobody else there is still nothing to measure against,
+        // and the take fails exactly as a single one would.
+        let matched = statuses.contains { $0.key != anchor && $0.value.isAligned }
+        guard matched else {
+            let lanes = order.map { laneID in
+                LaneSyncResult(
+                    laneID: laneID,
+                    label: labels[laneID] ?? "",
+                    status: .notDetected(
+                        reason: laneID == anchor
+                            ? "no other lane matched this clap"
+                            : (statuses[laneID]?.notDetectedReason ?? "no transient found")
+                    ),
+                    onsetSample: onsetSamples[laneID],
+                    onsetSNRdB: onsetSNRs[laneID],
+                    clipped: clipped.contains(laneID),
+                    suggestedDelaySamples: nil, suggestedDelayMs: nil,
+                    levels: levels[laneID]
+                )
+            }
+            return SyncResult(
+                referenceLaneID: nil, lanes: lanes, sampleRate: sampleRate,
+                failureSummary: SyncResult.noClapFailureSummary
+            )
+        }
+
         let delays = suggestedDelays(order: order, statuses: statuses, sampleRate: sampleRate)
         let lanes = order.map { laneID in
             LaneSyncResult(
@@ -286,7 +390,8 @@ public struct ClapAligner: Sendable {
                 onsetSNRdB: onsetSNRs[laneID],
                 clipped: clipped.contains(laneID),
                 suggestedDelaySamples: delays[laneID],
-                suggestedDelayMs: delays[laneID].map { Double($0) / sampleRate * 1000 }
+                suggestedDelayMs: delays[laneID].map { Double($0) / sampleRate * 1000 },
+                levels: levels[laneID]
             )
         }
         return SyncResult(referenceLaneID: anchor, lanes: lanes, sampleRate: sampleRate)
@@ -315,7 +420,7 @@ public struct ClapAligner: Sendable {
                 recording: lane, onset: onset, windowStart: 0, anchor: 0,
                 window: nil,
                 clipped: anyClipped(lane.samples, range: 0..<lane.samples.count),
-                failureReason: (onset.failure ?? .noTransient).reason
+                failureReason: onset.failure?.reason ?? "no dominant transient"
             )
         }
 
@@ -583,7 +688,8 @@ public struct ClapAligner: Sendable {
                 onsetSNRdB: preparation?.onset.onsetSNRdB,
                 clipped: preparation?.clipped ?? false,
                 suggestedDelaySamples: delay,
-                suggestedDelayMs: delay.map { Double($0) / sampleRate * 1000 }
+                suggestedDelayMs: delay.map { Double($0) / sampleRate * 1000 },
+                levels: preparation.flatMap { LaneLevels($0.onset) }
             )
         }
         return SyncResult(

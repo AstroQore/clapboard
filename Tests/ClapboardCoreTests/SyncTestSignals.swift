@@ -259,3 +259,138 @@ extension SyncResult {
         return measured - (trueDelay - referenceDelay)
     }
 }
+
+// MARK: - A real room
+
+extension SyncTestSignals {
+    /// One lane of a room recording: independent noise and independent bursts,
+    /// because two microphones in a room do not hear the same hiss, and only
+    /// the shared clap should ever correlate.
+    struct RoomLaneSpec {
+        var label: String
+        /// Arrival delay of the clap relative to the take's clap position.
+        var delaySamples: Double = 0
+        /// False for a lane that was pointed the other way, muted, or simply
+        /// never heard the clap: it gets the room and nothing else.
+        var hasClap: Bool = true
+        var isVirtual: Bool = false
+
+        init(_ label: String) { self.label = label }
+    }
+
+    struct RoomTake {
+        var lanes: [LaneRecording]
+        var truth: [UUID: Double]
+        var clapPosition: Double
+        var floorRMS: Double
+    }
+
+    /// Loudest `window`-sample RMS of a buffer: the number the onset detector
+    /// actually thresholds on.
+    static func peakWindowRMS(_ samples: [Float], window: Int) -> Double {
+        guard samples.count >= window, window > 0 else { return 0 }
+        var running = 0.0
+        for index in 0..<window {
+            let value = Double(samples[index])
+            running += value * value
+        }
+        var best = running
+        for index in window..<samples.count {
+            let entering = Double(samples[index])
+            let leaving = Double(samples[index - window])
+            running += entering * entering - leaving * leaving
+            best = max(best, running)
+        }
+        return (best / Double(window)).squareRoot()
+    }
+
+    /// Pink-ish noise: white through a one-pole lowpass, scaled to `rms`.
+    static func pinkish(count: Int, rms: Double, rng: inout SeededGenerator) -> [Float] {
+        guard count > 0 else { return [] }
+        var buffer = [Double](repeating: 0, count: count)
+        var state = 0.0
+        for index in 0..<count {
+            state = 0.85 * state + 0.15 * rng.gaussian()
+            buffer[index] = state
+        }
+        var energy = 0.0
+        for value in buffer { energy += value * value }
+        let current = (energy / Double(count)).squareRoot()
+        let scale = current > 1e-12 ? rms / current : 0
+        return buffer.map { Float($0 * scale) }
+    }
+
+    /// A room rather than a laboratory: a −40 dBFS pink-ish floor with a
+    /// speech-like burst 10–14 dB above it every ~300 ms, and — when asked —
+    /// exactly one clap, 25–30 dB above the floor, somewhere past 1.5 s.
+    ///
+    /// This is the signal the first real test in the user's room produced, and
+    /// the one the old "first frame 12 dB over the floor and twice its recent
+    /// past" rule fired on within milliseconds.
+    static func makeRoomTake(
+        _ specs: [RoomLaneSpec],
+        seed: UInt64,
+        seconds: Double = 6,
+        floorDBFS: Double = -40,
+        clapDBAboveFloor: ClosedRange<Double> = 25...30,
+        clapPosition: Double? = nil,
+        sampleRate: Double = sampleRate
+    ) -> RoomTake {
+        var rng = SeededGenerator(seed: seed &* 977 &+ 13)
+        let length = Int(seconds * sampleRate)
+        let floorRMS = pow(10, floorDBFS / 20)
+        let position = clapPosition
+            ?? (rng.uniform(1.5...(max(1.6, seconds - 1.5))) * sampleRate)
+        let clap = makeClap(seed: seed &+ 1, sampleRate: sampleRate)
+        let envelopeWindow = max(4, Int((0.001 * sampleRate).rounded()))
+        let clapPeakWindow = peakWindowRMS(clap, window: envelopeWindow)
+        let clapDB = rng.uniform(clapDBAboveFloor)
+        // Scale so the clap's own loudest 1 ms window lands exactly `clapDB`
+        // above the floor, whatever the clap's shape happens to be.
+        let clapAmplitude = clapPeakWindow > 0
+            ? Float(floorRMS * pow(10, clapDB / 20) / clapPeakWindow)
+            : 0
+
+        var lanes: [LaneRecording] = []
+        var truth: [UUID: Double] = [:]
+        for (index, spec) in specs.enumerated() {
+            var laneRNG = SeededGenerator(seed: seed &+ 4000 &+ UInt64(index))
+            var buffer = pinkish(count: length, rms: floorRMS, rng: &laneRNG)
+
+            // Speech, keys, a chair: short, frequent, and 10–14 dB up. Each is
+            // a perfectly good "transient" to anything that only compares a
+            // frame with its own recent past.
+            var at = laneRNG.uniform(0.05...0.3) * sampleRate
+            while at < Double(length) {
+                let burstLength = Int(laneRNG.uniform(0.005...0.020) * sampleRate)
+                let burstRMS = floorRMS * pow(10, laneRNG.uniform(10...14) / 20)
+                let burst = pinkish(count: burstLength, rms: burstRMS, rng: &laneRNG)
+                for (offset, value) in burst.enumerated() {
+                    let destination = Int(at) + offset
+                    guard destination >= 0, destination < length else { continue }
+                    // Raised cosine, so the burst is an event and not a click.
+                    let phase = 2 * Double.pi * Double(offset) / Double(max(1, burstLength - 1))
+                    buffer[destination] += Float(Double(value) * 0.5 * (1 - cos(phase)))
+                }
+                at += laneRNG.uniform(0.2...0.4) * sampleRate
+            }
+
+            if spec.hasClap {
+                add(
+                    clap: clap, to: &buffer,
+                    at: position + spec.delaySamples, amplitude: clapAmplitude
+                )
+            }
+
+            let lane = LaneRecording(
+                label: spec.label, samples: buffer,
+                sampleRate: sampleRate, isVirtual: spec.isVirtual
+            )
+            lanes.append(lane)
+            truth[lane.laneID] = spec.delaySamples
+        }
+        return RoomTake(
+            lanes: lanes, truth: truth, clapPosition: position, floorRMS: floorRMS
+        )
+    }
+}

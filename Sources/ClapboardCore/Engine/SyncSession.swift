@@ -77,6 +77,78 @@ public struct SyncEnvelopeSet: Sendable {
     }
 }
 
+/// One lane's envelope over the *whole* take, at the top of the result page.
+///
+/// The zoomed overlay below it only shows the few hundred milliseconds around
+/// the clap; this is what proves the analysed window *was* a clap — one spike
+/// out of a flat room — or shows at a glance that it was not.
+public struct SyncTakeEnvelope: Identifiable, Sendable {
+    public var id: UUID { laneID }
+    public let laneID: UUID
+    public let label: String
+    /// Peak magnitude per bucket, normalised to this lane's own maximum.
+    public let points: [Float]
+    /// Where the attack was found, in points, or `nil` when nothing was.
+    public let onsetPoint: Double?
+    /// The loudest 1 ms window, in points. Marked even on a refused lane: it
+    /// is the thing that was measured and rejected.
+    public let peakPoint: Double?
+    public let isAligned: Bool
+    /// How far the peak stood above the room, for the caption.
+    public let dominanceDB: Double?
+    public let multipleTransients: Bool
+    /// Why the lane was refused, `nil` when it was not.
+    public let notDetectedReason: String?
+
+    public init(
+        laneID: UUID,
+        label: String,
+        points: [Float],
+        onsetPoint: Double?,
+        peakPoint: Double?,
+        isAligned: Bool,
+        dominanceDB: Double?,
+        multipleTransients: Bool,
+        notDetectedReason: String?
+    ) {
+        self.laneID = laneID
+        self.label = label
+        self.points = points
+        self.onsetPoint = onsetPoint
+        self.peakPoint = peakPoint
+        self.isAligned = isAligned
+        self.dominanceDB = dominanceDB
+        self.multipleTransients = multipleTransients
+        self.notDetectedReason = notDetectedReason
+    }
+}
+
+/// Every lane's whole take on one axis. Computed in the session, never in a
+/// SwiftUI `body`.
+public struct SyncTakeEnvelopeSet: Sendable {
+    public let lanes: [SyncTakeEnvelope]
+    public let sampleRate: Double
+    public let samplesPerPoint: Double
+    public let durationSeconds: Double
+    /// The take stopped as soon as the clap had its tail.
+    public let endedEarly: Bool
+    public var pointCount: Int { lanes.first?.points.count ?? 0 }
+
+    public init(
+        lanes: [SyncTakeEnvelope],
+        sampleRate: Double,
+        samplesPerPoint: Double,
+        durationSeconds: Double,
+        endedEarly: Bool
+    ) {
+        self.lanes = lanes
+        self.sampleRate = sampleRate
+        self.samplesPerPoint = samplesPerPoint
+        self.durationSeconds = durationSeconds
+        self.endedEarly = endedEarly
+    }
+}
+
 /// What "Verify" found for one lane after the delays were applied.
 public struct SyncVerification: Sendable {
     public let laneID: UUID
@@ -152,20 +224,22 @@ public final class SyncSession {
     /// `SyncOptions.analysisWindowSeconds`.
     public var analysisWindowSeconds: Double = 0.02
 
-    /// Longest a single take listens for, including the "get ready" second.
+    /// How long CLAP NOW stays up. The whole point is that it is a *fixed*
+    /// window a human can react inside: the take is not cut short the moment
+    /// something bangs, only when a genuinely dominant transient has been
+    /// heard and its tail recorded.
+    public var listenSeconds: Double = 4
+    public var boundedListenSeconds: Double { min(8, max(3, listenSeconds)) }
+
+    /// Hard ceiling on one take, room tone included. The capture buffer is
+    /// armed for this, so a clap near the end of the listen window can still
+    /// have its tail recorded.
     public static let maxTakeSeconds: Double = 8
     /// Room tone recorded before the user is told to clap. `SyncOptions`
     /// wants at least 0.3 s of clap-free head for the noise floor.
     public static let readySeconds: Double = 1.0
     /// Audio kept after the clap, so the analysis window and its tail fit.
     public static let tailSeconds: Double = 1.0
-    /// A take never ends before this much has been recorded, however early the
-    /// transient watcher fires: the user has just been told to clap, and a
-    /// room noise that looks like a transient must not cost them the take.
-    /// It includes `readySeconds`, so it leaves two seconds to clap in — and
-    /// a real clap supersedes whatever fired first, which pushes the end out
-    /// again.
-    public static let minimumTakeSeconds: Double = readySeconds + 2.0
 
     public var syncOptions: SyncOptions {
         SyncOptions(
@@ -182,6 +256,17 @@ public final class SyncSession {
     public private(set) var captureProgress: Double = 0
     public private(set) var lastResult: SyncResult?
     public private(set) var envelopes: SyncEnvelopeSet?
+    /// Every lane's whole take, for the panel above the zoomed overlay.
+    public private(set) var takeEnvelopes: SyncTakeEnvelopeSet?
+    /// Seconds left of the CLAP NOW window, counted down for the sheet.
+    public private(set) var listenSecondsRemaining: Double = 0
+    /// How long the take that was kept actually ran.
+    public private(set) var takeDuration: Double = 0
+    /// The take stopped before the listen window was up, because a dominant
+    /// transient had already been heard and its tail recorded.
+    public private(set) var takeEndedEarly = false
+    /// Why the take stopped, in words, for `--sync-test` and the sheet.
+    public private(set) var takeEndReason: String = ""
     public private(set) var verifications: [SyncVerification] = []
     public private(set) var appliedDelays: [UUID: Int] = [:]
     /// Set when a lane's level reached `SyncOptions.clipThreshold` — the
@@ -259,6 +344,10 @@ public final class SyncSession {
         message = nil
         lastResult = nil
         envelopes = nil
+        takeEnvelopes = nil
+        takeDuration = 0
+        takeEndedEarly = false
+        takeEndReason = ""
         verifications = []
         appliedDelays = [:]
         verificationTake = []
@@ -283,6 +372,7 @@ public final class SyncSession {
         guard !phase.isBusy else { return }
         lastResult = nil
         envelopes = nil
+        takeEnvelopes = nil
         verifications = []
         verificationTake = []
         message = nil
@@ -328,6 +418,12 @@ public final class SyncSession {
             recordings: verificationTake,
             sampleRate: engine.sampleRate
         )
+        takeEnvelopes = SyncSessionMath.makeTakeEnvelopes(
+            result: result,
+            recordings: verificationTake,
+            sampleRate: engine.sampleRate,
+            endedEarly: takeEndedEarly
+        )
         message = SyncSessionMath.advice(for: result)
         phase = .results
     }
@@ -349,10 +445,13 @@ public final class SyncSession {
         }
 
         phase = .listening(take: index, of: total)
+        let options = syncOptions
         var probe = SyncOnsetProbe(
             sampleRate: sampleRate,
-            noiseFloorSeconds: SyncOptions().noiseFloorSeconds,
-            thresholdDB: SyncOptions().minOnsetSNRdB
+            noiseFloorSeconds: options.noiseFloorSeconds,
+            thresholdDB: options.minOnsetSNRdB,
+            dominanceDB: options.minDominanceDB,
+            minimumLeadSeconds: Self.readySeconds
         )
         var probes: [UUID: SyncOnsetProbe] = [:]
         // Virtual lanes replay somebody else's clock and often carry no clap
@@ -360,13 +459,23 @@ public final class SyncSession {
         // clearly meant them to.
         for lane in lanes where !lane.isVirtual { probes[lane.id] = probe }
         if probes.isEmpty { probes = Dictionary(uniqueKeysWithValues: lanes.map { ($0.id, probe) }) }
+
         let tailFrames = Int(Self.tailSeconds * sampleRate)
-        let floorFrames = Int(Self.minimumTakeSeconds * sampleRate)
+        let ceilingFrames = Int(Self.maxTakeSeconds * sampleRate)
+        let listenStart = engine.syncCapturedFrames
+        let listenEnd = listenStart + Int(boundedListenSeconds * sampleRate)
+        var endedEarly = false
+        var reason = "the listen window ran out"
 
         while !Task.isCancelled {
             captureProgress = engine.syncCaptureProgress
             let published = engine.syncCapturedFrames
-            var settled = false
+            listenSecondsRemaining = max(0, Double(listenEnd - published) / sampleRate)
+
+            // The probe follows the loudest transient, so an onset can move
+            // later while the take runs; the latest one across the lanes is
+            // the one whose tail has to fit.
+            var latestOnset: Int?
             for laneID in probes.keys {
                 probe = probes[laneID]!
                 let fresh = engine.syncCapturedSamples(
@@ -374,17 +483,40 @@ public final class SyncSession {
                 )
                 probe.append(fresh)
                 probes[laneID] = probe
-                if let onset = probe.onsetSample, published - onset >= tailFrames { settled = true }
+                if let onset = probe.onsetSample { latestOnset = max(latestOnset ?? onset, onset) }
             }
-            if (settled && published >= floorFrames) || captureProgress >= 1 { break }
+
+            if let onset = latestOnset, published - onset >= tailFrames {
+                endedEarly = published < listenEnd
+                reason = String(
+                    format: "a clap at %.2f s had its %.0f s of tail",
+                    Double(onset) / sampleRate, Self.tailSeconds
+                )
+                break
+            }
+            if published >= ceilingFrames || captureProgress >= 1 {
+                reason = latestOnset == nil
+                    ? "the take hit its ceiling with no dominant transient"
+                    : "the take hit its ceiling while recording the tail"
+                break
+            }
+            // Past the listen window with a transient in hand, the take runs on
+            // until that transient has its tail — a clap on the last second is
+            // still worth keeping.
+            if published >= listenEnd, latestOnset == nil { break }
             await pause(seconds: 0.04)
         }
 
         let captures = await engine.disarmSyncCapture()
         captureProgress = 0
-        return SyncSessionMath.makeRecordings(
+        listenSecondsRemaining = 0
+        let recordings = SyncSessionMath.makeRecordings(
             lanes: lanes, captures: captures, sampleRate: sampleRate
         )
+        takeDuration = recordings.first?.durationSeconds ?? 0
+        takeEndedEarly = endedEarly
+        takeEndReason = reason
+        return recordings
     }
 
     /// Sleeps without being short-circuited by cancellation: the capture
@@ -626,10 +758,53 @@ public enum SyncSessionMath {
         return SyncEnvelopeSet(lanes: lanes, samplesPerPoint: perPoint, sampleRate: sampleRate)
     }
 
+    /// The whole take, one 2000-point envelope per lane, with the onset and
+    /// the peak the detector actually used.
+    public static func makeTakeEnvelopes(
+        result: SyncResult,
+        recordings: [LaneRecording],
+        sampleRate: Double,
+        endedEarly: Bool,
+        points: Int = 2000
+    ) -> SyncTakeEnvelopeSet? {
+        guard !recordings.isEmpty else { return nil }
+        let length = recordings.map(\.samples.count).max() ?? 0
+        guard length > 0 else { return nil }
+        let perPoint = Double(length) / Double(points)
+        let lanes = result.lanes.compactMap { lane -> SyncTakeEnvelope? in
+            guard let recording = recordings.first(where: { $0.laneID == lane.laneID })
+            else { return nil }
+            return SyncTakeEnvelope(
+                laneID: lane.laneID,
+                label: lane.label,
+                points: envelope(
+                    samples: recording.samples, from: 0, count: length, points: points
+                ),
+                onsetPoint: lane.onsetSample.map { Double($0) / perPoint },
+                peakPoint: lane.levels.map { Double($0.peakSample) / perPoint },
+                isAligned: lane.status.isAligned,
+                dominanceDB: lane.levels?.dominanceDB,
+                multipleTransients: lane.levels?.multipleTransients ?? false,
+                notDetectedReason: lane.status.notDetectedReason
+            )
+        }
+        guard !lanes.isEmpty else { return nil }
+        return SyncTakeEnvelopeSet(
+            lanes: lanes,
+            sampleRate: sampleRate,
+            samplesPerPoint: perPoint,
+            durationSeconds: sampleRate > 0 ? Double(length) / sampleRate : 0,
+            endedEarly: endedEarly
+        )
+    }
+
     /// One line of plain advice under the results table, or `nil`.
     public static func advice(for result: SyncResult) -> String? {
         if result.referenceLaneID == nil {
-            return "Nothing heard a clap. Check that the lanes are unmuted and that the levels move, then try again."
+            let summary = result.failureSummary ?? SyncResult.noClapFailureSummary
+            return summary
+                + " Check that the lanes are unmuted and that the levels move,"
+                + " then clap once, hard, while the sheet says CLAP NOW."
         }
         var notes: [String] = []
         let clipped = result.lanes.filter(\.clipped).map(\.label)
@@ -655,47 +830,79 @@ public enum SyncSessionMath {
 /// decide is "the clap has happened, we can stop recording". The measurement
 /// itself is `ClapAligner`'s job.
 ///
-/// The two tests are the ones `OnsetDetector` uses, for the same reason: a
-/// *median* noise floor, because a mean is dragged upwards by the very
-/// transients it is meant to exclude, and a steepness test against the recent
-/// past, because a busy room's 1 ms windows swing well past 12 dB on their own.
-/// It also keeps tracking after the first hit and follows the *loudest*
-/// transient, so a door closing early in the take does not end it before the
-/// user has clapped.
+/// The rule is `OnsetDetector`'s, made incremental: a window counts only when
+/// it is `dominanceDB` above the *median* of every window seen so far — what
+/// the room sounds like — as well as `thresholdDB` above the noise floor of
+/// the clap-free head. A busy room's 1 ms windows swing 20 dB above their own
+/// floor on their own, so the floor test alone ends the take on the first
+/// syllable or chair; only a clap is 20 dB above everything else.
+///
+/// The running median is kept as a 0.25 dB histogram — a full sort of every
+/// window would be quadratic over a take — and refreshed every
+/// `medianRefreshWindows` windows, which is far finer than the level moves.
+/// Nothing here depends on where a chunk boundary falls.
+///
+/// Two more rules keep it honest: nothing counts until `minimumLeadSeconds` of
+/// audio exists (the user has only just been told to clap), and it keeps
+/// tracking afterwards and follows the *loudest* transient, so a door closing
+/// early in the take cannot end it before the clap.
 public struct SyncOnsetProbe: Sendable {
     /// 1 ms windows, as in `SyncOptions.envelopeWindowSeconds`.
     public let windowSamples: Int
     /// Windows of the head averaged into the noise floor.
     public let noiseWindows: Int
-    /// How far above the floor a window has to sit.
+    /// How far above the head noise floor a window has to sit.
     public let thresholdDB: Double
-    /// Windows a candidate is compared against for steepness.
-    public let riseWindows: Int
-    /// How much a window must exceed its recent past.
-    public static let riseFactor = 2.0
+    /// How far above the running median a window has to sit.
+    public let dominanceDB: Double
+    /// Audio that must exist before any window may be called a clap.
+    public let minimumLeadSamples: Int
     /// How much louder a later transient has to be before it takes over.
     public static let supersedeFactor = 1.5
     /// Roughly −100 dBFS: keeps a digitally silent head from making every
     /// sample an onset.
     public static let floorEpsilon = 1e-5
+    /// Windows between two refreshes of the running median.
+    public static let medianRefreshWindows = 32
 
     /// Samples consumed so far.
     public private(set) var scanned = 0
     /// Start of the loudest qualifying window so far, or `nil`.
     public private(set) var onsetSample: Int?
+    /// Median 1 ms RMS of the clap-free head.
     public private(set) var noiseFloor: Double = 0
+    /// Median 1 ms RMS of everything seen so far: the room, not the clap.
+    public private(set) var medianLevel: Double = 0
 
     private var head: [Double] = []
-    private var history: [Double] = []
     private var carry: [Float] = []
     private var onsetLevel: Double = 0
     private var floorSettled = false
 
-    public init(sampleRate: Double, noiseFloorSeconds: Double = 0.3, thresholdDB: Double = 12) {
+    // MARK: - Level histogram
+
+    /// 0.25 dB bins from −140 dBFS to +6 dBFS.
+    private static let binsPerDecibel = 4.0
+    private static let lowestDecibel = -140.0
+    private static let binCount = 585
+    private var histogram = [Int32](repeating: 0, count: SyncOnsetProbe.binCount)
+    private var windowsSeen = 0
+    /// Starts at the refresh interval so the very first window computes a
+    /// median rather than running against zero.
+    private var windowsSinceMedian = SyncOnsetProbe.medianRefreshWindows
+
+    public init(
+        sampleRate: Double,
+        noiseFloorSeconds: Double = 0.3,
+        thresholdDB: Double = 12,
+        dominanceDB: Double = 20,
+        minimumLeadSeconds: Double = 1.0
+    ) {
         windowSamples = max(4, Int((0.001 * sampleRate).rounded()))
         noiseWindows = max(1, Int(noiseFloorSeconds * sampleRate) / windowSamples)
-        riseWindows = max(1, Int(0.005 * sampleRate) / windowSamples)
+        minimumLeadSamples = max(0, Int(minimumLeadSeconds * sampleRate))
         self.thresholdDB = thresholdDB
+        self.dominanceDB = dominanceDB
     }
 
     /// Feeds the samples that arrived since the last call. Chunk boundaries do
@@ -703,7 +910,8 @@ public struct SyncOnsetProbe: Sendable {
     public mutating func append(_ samples: [Float]) {
         guard !samples.isEmpty else { return }
         carry.append(contentsOf: samples)
-        let ratio = pow(10, thresholdDB / 20)
+        let snrRatio = pow(10, thresholdDB / 20)
+        let dominanceRatio = pow(10, dominanceDB / 20)
         var offset = 0
         while carry.count - offset >= windowSamples {
             var sum = 0.0
@@ -713,6 +921,7 @@ public struct SyncOnsetProbe: Sendable {
             }
             let rms = (sum / Double(windowSamples)).squareRoot()
             let windowStart = scanned + offset
+            record(rms)
 
             if !floorSettled {
                 head.append(rms)
@@ -722,22 +931,48 @@ public struct SyncOnsetProbe: Sendable {
                     noiseFloor = Self.median(voiced.isEmpty ? head : voiced)
                     floorSettled = true
                 }
-            } else {
-                let threshold = max(noiseFloor, Self.floorEpsilon) * ratio
-                let past = max(Self.median(history), Self.floorEpsilon)
-                if rms >= threshold, rms >= Self.riseFactor * past,
+            } else if windowStart + windowSamples >= minimumLeadSamples {
+                let floor = max(noiseFloor, Self.floorEpsilon) * snrRatio
+                let room = max(medianLevel, Self.floorEpsilon) * dominanceRatio
+                if rms >= floor, rms >= room,
                    onsetSample == nil || rms > onsetLevel * Self.supersedeFactor {
                     onsetSample = windowStart
                     onsetLevel = rms
                 }
             }
 
-            history.append(rms)
-            if history.count > riseWindows { history.removeFirst(history.count - riseWindows) }
             offset += windowSamples
         }
         scanned += offset
         if offset > 0 { carry.removeFirst(offset) }
+    }
+
+    /// Adds one window to the histogram and refreshes `medianLevel` on the
+    /// cadence. O(1) per window, O(bins) per refresh.
+    private mutating func record(_ rms: Double) {
+        let decibels = rms > 1e-12 ? 20 * log10(rms) : Self.lowestDecibel
+        let raw = Int(((decibels - Self.lowestDecibel) * Self.binsPerDecibel).rounded(.down))
+        histogram[min(max(raw, 0), Self.binCount - 1)] += 1
+        windowsSeen += 1
+        windowsSinceMedian += 1
+        guard windowsSinceMedian >= Self.medianRefreshWindows else { return }
+        windowsSinceMedian = 0
+        medianLevel = medianFromHistogram()
+    }
+
+    private func medianFromHistogram() -> Double {
+        guard windowsSeen > 0 else { return 0 }
+        let target = windowsSeen / 2
+        var seen = 0
+        for bin in 0..<Self.binCount {
+            seen += Int(histogram[bin])
+            if seen > target {
+                if bin == 0 { return 0 }
+                let decibels = Self.lowestDecibel + (Double(bin) + 0.5) / Self.binsPerDecibel
+                return pow(10, decibels / 20)
+            }
+        }
+        return 0
     }
 
     static func median(_ values: [Double]) -> Double {

@@ -166,19 +166,63 @@ struct SyncSessionTests {
     }
 
     @Test func adviceNamesTheLanesThatNeedTheUsersAttention() {
+        // Two lanes heard the clap, so there is a measurement; the third did
+        // not, and that is what the advice line is for.
         let take = SyncTestSignals.makeTake(
             [
                 LaneSpec("clean"),
+                { var spec = LaneSpec("clean 2"); spec.delaySamples = 320.5; return spec }(),
                 { var spec = LaneSpec("quiet"); spec.content = .silence; return spec }()
             ],
             seed: 5
         )
         let result = ClapAligner().analyze(take.lanes)
+        #expect(result.failureSummary == nil)
         let advice = SyncSessionMath.advice(for: result)
         #expect(advice?.contains("not detected") == true)
 
-        let nothing = SyncResult(referenceLaneID: nil, lanes: [], sampleRate: Self.sampleRate)
-        #expect(SyncSessionMath.advice(for: nothing)?.contains("Nothing heard a clap") == true)
+        // A take with no reference leads with the failure summary instead.
+        let nothing = SyncResult(
+            referenceLaneID: nil, lanes: [], sampleRate: Self.sampleRate,
+            failureSummary: SyncResult.noClapFailureSummary
+        )
+        let failure = SyncSessionMath.advice(for: nothing)
+        #expect(failure?.hasPrefix(SyncResult.noClapFailureSummary) == true)
+        #expect(failure?.contains("CLAP NOW") == true)
+        // Even without a summary the advice must not pretend anything worked.
+        let bare = SyncResult(referenceLaneID: nil, lanes: [], sampleRate: Self.sampleRate)
+        #expect(SyncSessionMath.advice(for: bare)?.contains("No clap") == true)
+    }
+
+    @Test func theWholeTakeIsDrawnWithItsOnsetAndPeakMarkers() {
+        var near = SyncTestSignals.RoomLaneSpec("near")
+        var far = SyncTestSignals.RoomLaneSpec("far")
+        far.delaySamples = 260.5
+        let take = SyncTestSignals.makeRoomTake([near, far], seed: 21, seconds: 4)
+        let result = ClapAligner().analyze(take.lanes)
+
+        let set = try! #require(SyncSessionMath.makeTakeEnvelopes(
+            result: result, recordings: take.lanes,
+            sampleRate: Self.sampleRate, endedEarly: true, points: 2000
+        ))
+        #expect(set.lanes.count == 2)
+        #expect(set.pointCount == 2000)
+        #expect(abs(set.durationSeconds - 4) < 0.01)
+        #expect(set.endedEarly)
+        for lane in set.lanes {
+            #expect(lane.points.count == 2000)
+            #expect(lane.points.allSatisfy { $0 >= 0 && $0 <= 1 })
+            let onset = try! #require(lane.onsetPoint)
+            let peak = try! #require(lane.peakPoint)
+            // Both markers sit on the clap, which is somewhere past 1.5 s.
+            let expected = take.clapPosition / (4 * Self.sampleRate) * 2000
+            #expect(abs(onset - expected) < 4, "onset point \(onset) vs \(expected)")
+            #expect(abs(peak - expected) < 4, "peak point \(peak) vs \(expected)")
+            #expect(lane.isAligned)
+            #expect((lane.dominanceDB ?? 0) >= 20)
+            #expect(lane.notDetectedReason == nil)
+        }
+        _ = near
     }
 
     // MARK: - Early-stop transient watcher
@@ -200,9 +244,11 @@ struct SyncSessionTests {
     }
 
     @Test func feedingTheProbeInChunksMatchesFeedingItAllAtOnce() {
-        var samples = [Float](repeating: 0, count: Int(1.5 * Self.sampleRate))
+        var samples = [Float](repeating: 0, count: Int(2.5 * Self.sampleRate))
         for index in samples.indices { samples[index] = Float(sin(Double(index) * 0.11)) * 0.002 }
-        let arrival = Int(0.9 * Self.sampleRate)
+        // Past the one second of lead the probe insists on before anything can
+        // count as a clap.
+        let arrival = Int(1.9 * Self.sampleRate)
         for (offset, value) in SyncTestSignals.makeClap(seed: 11).enumerated() {
             samples[arrival + offset] += value * 0.4
         }
@@ -219,8 +265,49 @@ struct SyncSessionTests {
             chunked.append(Array(samples[index..<end]))
             index = end
         }
+        #expect(whole.onsetSample != nil)
         #expect(chunked.onsetSample == whole.onsetSample)
         #expect(chunked.scanned == whole.scanned)
+    }
+
+    @Test func theProbeIgnoresARoomFullOfBurstsForTheWholeListenWindow() {
+        var spec = SyncTestSignals.RoomLaneSpec("mic")
+        spec.hasClap = false
+        let room = SyncTestSignals.makeRoomTake([spec], seed: 606, seconds: 4)
+
+        // Fed the way the session feeds it: whatever the render thread has
+        // published since the last 40 ms poll.
+        var probe = SyncOnsetProbe(sampleRate: Self.sampleRate)
+        var index = 0
+        while index < room.lanes[0].samples.count {
+            let end = min(room.lanes[0].samples.count, index + 1913)
+            probe.append(Array(room.lanes[0].samples[index..<end]))
+            #expect(probe.onsetSample == nil, "fired at \(probe.onsetSample ?? -1)")
+            index = end
+        }
+        #expect(probe.onsetSample == nil)
+        #expect(probe.medianLevel > 0)
+    }
+
+    @Test func theProbeFiresOnTheClapAndNotBefore() {
+        let room = SyncTestSignals.makeRoomTake(
+            [SyncTestSignals.RoomLaneSpec("mic")], seed: 707, seconds: 5
+        )
+        let samples = room.lanes[0].samples
+        let arrival = Int(room.clapPosition)
+
+        var probe = SyncOnsetProbe(sampleRate: Self.sampleRate)
+        var index = 0
+        while index < samples.count {
+            let end = min(samples.count, index + 1913)
+            probe.append(Array(samples[index..<end]))
+            // Nothing in the room before the clap may end the take.
+            if end < arrival { #expect(probe.onsetSample == nil, "fired at \(probe.onsetSample ?? -1)") }
+            index = end
+        }
+        let onset = try! #require(probe.onsetSample)
+        #expect(abs(onset - arrival) < Int(0.003 * Self.sampleRate),
+                "onset \(onset) vs clap \(arrival)")
     }
 
     @Test func steadyRoomToneNeverLooksLikeAClap() {

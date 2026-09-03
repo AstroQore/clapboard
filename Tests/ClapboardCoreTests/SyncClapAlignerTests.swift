@@ -10,8 +10,12 @@ struct SyncClapAlignerTests {
 
     // MARK: - Clean signals
 
-    @Test("clean lanes at 40, 20 and 10 dB SNR land within half a sample",
-          arguments: [40.0, 20.0, 10.0])
+    // 15 dB of clap-to-noise is where a 1 ms clap peak still stands the
+    // required 20 dB above the median of the take; below that the clap is no
+    // longer dominant and is refused on purpose — see
+    // `refusesAClapThatDoesNotStandOutFromTheRoom`.
+    @Test("clean lanes at 40, 20 and 15 dB SNR land within half a sample",
+          arguments: [40.0, 20.0, 15.0])
     func alignsCleanLanes(snrdB: Double) {
         var near = LaneSpec("near")
         near.snrdB = snrdB
@@ -35,6 +39,29 @@ struct SyncClapAlignerTests {
             let error = result.offsetError(laneID: lane.laneID, truth: take.truth) ?? .infinity
             #expect(abs(error) <= 0.5, "\(lane.label) off by \(error) samples at \(snrdB) dB")
         }
+    }
+
+    @Test("a clap that does not stand out from the room is refused, not guessed")
+    func refusesAClapThatDoesNotStandOutFromTheRoom() {
+        var near = LaneSpec("near")
+        near.snrdB = 5
+        var far = LaneSpec("far")
+        far.delaySamples = 137.3
+        far.snrdB = 5
+
+        let take = SyncTestSignals.makeTake([near, far], seed: 555)
+        let result = aligner.analyze(take.lanes)
+
+        #expect(result.referenceLaneID == nil)
+        #expect(result.failureSummary == SyncResult.noClapFailureSummary)
+        for lane in result.lanes {
+            #expect(lane.status.isAligned == false)
+            #expect(lane.suggestedDelaySamples == nil)
+            #expect((lane.levels?.dominanceDB ?? 99) < 20)
+        }
+        #expect(result.lanes.contains {
+            $0.status.notDetectedReason?.contains("no dominant transient") == true
+        })
     }
 
     // MARK: - Rooms
@@ -212,9 +239,137 @@ struct SyncClapAlignerTests {
         let take = SyncTestSignals.makeTake([early, tooLate], seed: 300, clapPosition: 0.5 * 48_000)
         let result = aligner.analyze(take.lanes)
 
-        let status = result[take.lanes[1].laneID]?.status
-        #expect(status?.isAligned == false, "\(String(describing: status))")
-        #expect(status?.notDetectedReason?.contains("search window") == true)
+        // Neither lane can explain the other, so the take has no reference at
+        // all: one lane says why it was out of range, the other says nobody
+        // matched it. Nothing is written either way.
+        #expect(result.referenceLaneID == nil)
+        #expect(result.failureSummary == SyncResult.noClapFailureSummary)
+        #expect(result.lanes.allSatisfy { $0.status.isAligned == false })
+        #expect(result.lanes.allSatisfy { $0.suggestedDelaySamples == nil })
+        #expect(
+            result.lanes.contains {
+                $0.status.notDetectedReason?.contains("search window") == true
+            },
+            "\(result.lanes.map { $0.status.notDetectedReason ?? "aligned" })"
+        )
+    }
+
+    @Test("a reference nobody matched is not a reference")
+    func refusesATakeOnlyOneLaneHeard() {
+        var heard = LaneSpec("heard it")
+        heard.snrdB = 35
+        var missed = LaneSpec("missed it")
+        missed.content = .silence
+
+        let take = SyncTestSignals.makeTake([heard, missed], seed: 4004)
+        let result = aligner.analyze(take.lanes)
+
+        #expect(result.referenceLaneID == nil)
+        #expect(result.failureSummary == SyncResult.noClapFailureSummary)
+        #expect(result.alignedLanes.isEmpty)
+        #expect(
+            result[take.lanes[0].laneID]?.status.notDetectedReason
+                == "no other lane matched this clap"
+        )
+        #expect(result[take.lanes[1].laneID]?.status.notDetectedReason?.contains("silent") == true)
+        // The lane still reports the levels that explain the verdict.
+        #expect((result[take.lanes[0].laneID]?.levels?.dominanceDB ?? 0) > 20)
+    }
+
+    @Test("two claps in one take still align on the loudest of them")
+    func alignsOnTheLoudestOfTwoClaps() {
+        var near = LaneSpec("near")
+        near.snrdB = 30
+        var far = LaneSpec("far")
+        far.delaySamples = 421.5
+        far.snrdB = 30
+
+        let take = SyncTestSignals.makeTake([near, far], seed: 1_357, clapPosition: 0.6 * 48_000)
+        let second = SyncTestSignals.makeClap(seed: 2_468)
+        let gap = 1.5 * 48_000
+        let delays = [0.0, 421.5]
+        let lanes = zip(take.lanes, delays).map { lane, delay -> LaneRecording in
+            var samples = lane.samples
+            SyncTestSignals.add(
+                clap: second, to: &samples,
+                at: take.clapPosition + gap + delay,
+                amplitude: SyncTestSignals.clapLevel * 1.5
+            )
+            return LaneRecording(
+                laneID: lane.laneID, label: lane.label, samples: samples,
+                sampleRate: lane.sampleRate, isVirtual: lane.isVirtual
+            )
+        }
+
+        let result = aligner.analyze(lanes)
+        #expect(result.referenceLaneID != nil)
+        #expect(result.failureSummary == nil)
+        for lane in lanes {
+            #expect(result[lane.laneID]?.status.isAligned == true, "\(lane.label)")
+            #expect(result[lane.laneID]?.levels?.multipleTransients == true, "\(lane.label)")
+            let error = result.offsetError(laneID: lane.laneID, truth: take.truth) ?? .infinity
+            #expect(abs(error) <= 1.0, "\(lane.label) off by \(error) samples")
+        }
+    }
+
+    // MARK: - A real room
+
+    @Test("a room with one clap on two lanes is measured; the same room without one is refused",
+          arguments: [UInt64(11), 12, 13, 14])
+    func measuresARoomTakeAndRefusesAClaplessOne(seed: UInt64) {
+        var near = SyncTestSignals.RoomLaneSpec("near")
+        var far = SyncTestSignals.RoomLaneSpec("far")
+        far.delaySamples = 317.4
+
+        let heard = SyncTestSignals.makeRoomTake([near, far], seed: seed)
+        let result = aligner.analyze(heard.lanes)
+        #expect(result.failureSummary == nil)
+        #expect(result.referenceLaneID != nil)
+        for lane in heard.lanes {
+            #expect(result[lane.laneID]?.status.isAligned == true, "\(lane.label)")
+            let error = result.offsetError(laneID: lane.laneID, truth: heard.truth) ?? .infinity
+            #expect(abs(error) <= 1.0, "\(lane.label) off by \(error) samples")
+            #expect((result[lane.laneID]?.levels?.dominanceDB ?? 0) >= 20)
+        }
+
+        // The same room, nobody clapped: nothing may be measured or applied.
+        near.hasClap = false
+        far.hasClap = false
+        let missed = SyncTestSignals.makeRoomTake([near, far], seed: seed)
+        let empty = aligner.analyze(missed.lanes)
+        #expect(empty.referenceLaneID == nil)
+        #expect(empty.failureSummary == SyncResult.noClapFailureSummary)
+        #expect(empty.alignedLanes.isEmpty)
+        #expect(empty.lanes.allSatisfy { $0.suggestedDelaySamples == nil })
+        #expect(empty.lanes.allSatisfy {
+            $0.status.notDetectedReason?.contains("no dominant transient") == true
+        })
+        #expect(SyncSessionMath.delayAssignments(from: empty).isEmpty)
+    }
+
+    @Test("a room where only one lane heard the clap fails instead of aligning one lane")
+    func refusesARoomOnlyOneLaneHeard() {
+        var heard = SyncTestSignals.RoomLaneSpec("heard it")
+        var missed = SyncTestSignals.RoomLaneSpec("missed it")
+        missed.hasClap = false
+        missed.delaySamples = 200
+
+        let take = SyncTestSignals.makeRoomTake([heard, missed], seed: 4_242)
+        let result = aligner.analyze(take.lanes)
+
+        #expect(result.referenceLaneID == nil)
+        #expect(result.failureSummary == SyncResult.noClapFailureSummary)
+        #expect(result.alignedLanes.isEmpty)
+        #expect(result.notDetectedLanes.count == 2)
+        #expect(
+            result[take.lanes[0].laneID]?.status.notDetectedReason
+                == "no other lane matched this clap"
+        )
+        // The lane that did hear it still reports a healthy dominance, so the
+        // sheet can say "one lane heard a clap and nobody else did".
+        #expect((result[take.lanes[0].laneID]?.levels?.dominanceDB ?? 0) >= 20)
+        #expect((result[take.lanes[1].laneID]?.levels?.dominanceDB ?? 99) < 20)
+        _ = heard
     }
 
     // MARK: - Delays
@@ -417,13 +572,17 @@ struct SyncClapAlignerTests {
         }
 
         // Whichever lane anchors the takes, the other one moved every time and
-        // must be refused.
+        // must be refused — which leaves the anchor with nobody to be measured
+        // against, so the whole take fails rather than pretending to be half
+        // aligned.
         let result = aligner.analyzeMultiple(rekeyed)
-        let moving = try! #require(laneIDs.first { $0 != result.referenceLaneID })
-        let status = result[moving]?.status
-        #expect(status?.isAligned == false, "\(String(describing: status))")
-        #expect(status?.notDetectedReason?.contains("disagree") == true)
-        #expect(result[moving]?.suggestedDelaySamples == nil)
+        #expect(result.referenceLaneID == nil)
+        #expect(result.failureSummary == SyncResult.noClapFailureSummary)
+        #expect(result.alignedLanes.isEmpty)
+        #expect(result.lanes.allSatisfy { $0.suggestedDelaySamples == nil })
+        let reasons = result.lanes.compactMap { $0.status.notDetectedReason }
+        #expect(reasons.contains { $0.contains("disagree") }, "\(reasons)")
+        #expect(reasons.contains { $0.contains("no other lane matched") }, "\(reasons)")
     }
 
     @Test("accuracy holds across many random claps, not just one lucky seed")
@@ -511,12 +670,15 @@ struct SyncClapAlignerTests {
         #expect(aligner.analyze([]).lanes.isEmpty)
         #expect(aligner.analyzeMultiple([]).lanes.isEmpty)
 
+        // One lane cannot be measured against anything, however good its clap
+        // is: Auto Sync needs two lanes that heard the same thing.
         var solo = LaneSpec("solo")
         solo.snrdB = 30
         let take = SyncTestSignals.makeTake([solo], seed: 1)
         let single = aligner.analyze(take.lanes)
-        #expect(single.referenceLaneID == take.lanes[0].laneID)
-        #expect(single[take.lanes[0].laneID]?.suggestedDelaySamples == 0)
+        #expect(single.referenceLaneID == nil)
+        #expect(single.failureSummary == SyncResult.noClapFailureSummary)
+        #expect(single[take.lanes[0].laneID]?.suggestedDelaySamples == nil)
 
         let odd = LaneRecording(
             label: "44.1k", samples: take.lanes[0].samples, sampleRate: 44_100

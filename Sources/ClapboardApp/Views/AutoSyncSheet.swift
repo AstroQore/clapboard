@@ -50,7 +50,10 @@ struct AutoSyncSheet: View {
         case .listening(let take, let total):
             return total > 1 ? "Take \(take) of \(total)" : "Listening"
         case .analysing: return "Cross-correlating…"
-        case .results: return "Nothing has been written to the lanes yet."
+        case .results:
+            return session.lastResult?.failureSummary == nil
+                ? "Nothing has been written to the lanes yet."
+                : "Nothing was measured."
         case .verifying: return "Re-measuring through the applied delays…"
         case .done: return "Applied."
         case .failed: return "Did not complete."
@@ -168,6 +171,20 @@ struct AutoSyncSheet: View {
                             .foregroundStyle(.secondary)
                     }
                     GridRow {
+                        Text("Listen for")
+                        Picker("", selection: $session.listenSeconds) {
+                            Text("3 s").tag(3.0)
+                            Text("4 s").tag(4.0)
+                            Text("6 s").tag(6.0)
+                            Text("8 s").tag(8.0)
+                        }
+                        .labelsHidden()
+                        .frame(width: 110)
+                        Text("How long CLAP NOW stays up. The take stops early only once a real clap has been heard.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    GridRow {
                         Text("Confidence")
                         Toggle("Relaxed", isOn: $session.relaxed)
                             .toggleStyle(.checkbox)
@@ -200,7 +217,10 @@ struct AutoSyncSheet: View {
                 Text("CLAP NOW")
                     .font(.system(size: 44, weight: .heavy))
                     .foregroundStyle(.orange)
-                Text("One sharp clap. Recording stops a second after it lands.")
+                Text(String(format: "%.0f", max(0, session.listenSecondsRemaining.rounded(.up))))
+                    .font(.system(size: 40, weight: .bold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text("One sharp clap, any time in that window. Recording stops a second after it lands.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -223,7 +243,9 @@ struct AutoSyncSheet: View {
         if let result = session.lastResult {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if let message = session.message {
+                    if let failure = result.failureSummary {
+                        failureBanner(failure)
+                    } else if let message = session.message {
                         Label(message, systemImage: "info.circle")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -236,9 +258,14 @@ struct AutoSyncSheet: View {
                         verifications: session.verifications
                     )
 
-                    if let envelopes = session.envelopes {
+                    if let takes = session.takeEnvelopes {
+                        SyncTakePanel(set: takes)
+                    }
+
+                    // The zoom is only worth drawing when something lined up.
+                    if let envelopes = session.envelopes, !result.alignedLanes.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Waveforms")
+                            Text("Around the clap")
                                 .font(.subheadline.weight(.semibold))
                             HStack(spacing: 10) {
                                 SyncWaveformPanel(title: "Before", set: envelopes, shifted: false)
@@ -263,6 +290,23 @@ struct AutoSyncSheet: View {
         }
     }
 
+    /// The one thing the user has to read when a take comes back empty.
+    private func failureBanner(_ summary: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(summary, systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text("No delay was changed. Clap once, hard, while the sheet says CLAP NOW — "
+                 + "the whole take is drawn below, so you can see what was heard instead.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+    }
+
     // MARK: - Footer
 
     private var footer: some View {
@@ -283,13 +327,16 @@ struct AutoSyncSheet: View {
             case .armed, .listening, .analysing, .verifying:
                 Button("Cancel") { session.cancel() }
             case .results, .done:
+                // With nothing measured, clapping again is the only useful
+                // thing to do, so Retake takes the return key.
                 Button("Retake") { session.retake() }
+                    .keyboardShortcut(hasSomethingToApply ? .none : .defaultAction)
                 Button("Apply") { session.apply() }
                     .disabled(!hasSomethingToApply)
                 Button("Apply + Verify") {
                     Task { await session.applyAndVerify() }
                 }
-                .keyboardShortcut(.defaultAction)
+                .keyboardShortcut(hasSomethingToApply ? .defaultAction : .none)
                 .disabled(!hasSomethingToApply)
                 Button("Close") { dismiss() }
             }
@@ -299,7 +346,8 @@ struct AutoSyncSheet: View {
     }
 
     private var hasSomethingToApply: Bool {
-        (session.lastResult?.alignedLanes.isEmpty == false)
+        guard let result = session.lastResult else { return false }
+        return result.failureSummary == nil && !result.alignedLanes.isEmpty
     }
 }
 
@@ -438,101 +486,5 @@ private struct SyncResultTable: View {
                 }
             }
         }
-    }
-}
-
-// MARK: - Waveform overlay
-
-private struct SyncWaveformPanel: View {
-    let title: String
-    let set: SyncEnvelopeSet
-    let shifted: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            SyncWaveformOverlay(set: set, shifted: shifted)
-                .frame(height: 150)
-                .background(.background.secondary, in: RoundedRectangle(cornerRadius: 6))
-        }
-        .frame(maxWidth: .infinity)
-    }
-}
-
-/// Every lane's envelope on one time axis, drawn twice by the caller: as
-/// recorded, and shifted right by the delay Auto Sync suggests. Lined up, the
-/// onsets in the right-hand panel form one vertical column.
-private struct SyncWaveformOverlay: View {
-    let set: SyncEnvelopeSet
-    let shifted: Bool
-
-    private static let palette: [Color] = [.blue, .green, .orange, .purple, .pink, .teal, .indigo, .brown]
-
-    var body: some View {
-        Canvas { context, size in
-            let lanes = set.lanes
-            let count = set.pointCount
-            guard count > 1, !lanes.isEmpty else { return }
-            let scaleX = size.width / CGFloat(count)
-            let rowHeight = size.height / CGFloat(lanes.count)
-
-            // Where the aligned lanes should end up: the latest arrival.
-            let target = lanes.compactMap { lane -> Double? in
-                guard lane.isAligned, let onset = lane.onsetPoint else { return nil }
-                return onset + (shifted ? lane.shiftPoints : 0)
-            }.max()
-
-            for (index, lane) in lanes.enumerated() {
-                let colour = Self.palette[index % Self.palette.count]
-                let top = rowHeight * CGFloat(index)
-                let base = top + rowHeight - 3
-                let amplitude = rowHeight - 8
-                let shift = CGFloat(shifted ? lane.shiftPoints : 0) * scaleX
-
-                var path = Path()
-                path.move(to: CGPoint(x: shift, y: base))
-                for point in 0..<count {
-                    path.addLine(to: CGPoint(
-                        x: CGFloat(point) * scaleX + shift,
-                        y: base - CGFloat(lane.points[point]) * amplitude
-                    ))
-                }
-                path.addLine(to: CGPoint(x: CGFloat(count - 1) * scaleX + shift, y: base))
-                path.closeSubpath()
-
-                context.fill(path, with: .color(colour.opacity(lane.isAligned ? 0.55 : 0.2)))
-                context.stroke(
-                    Path { line in
-                        line.move(to: CGPoint(x: 0, y: base))
-                        line.addLine(to: CGPoint(x: size.width, y: base))
-                    },
-                    with: .color(.secondary.opacity(0.25)),
-                    lineWidth: 0.5
-                )
-                context.draw(
-                    Text(lane.label)
-                        .font(.system(size: 9))
-                        .foregroundStyle(lane.isAligned ? colour : Color.secondary),
-                    at: CGPoint(x: 4, y: top + 7),
-                    anchor: .topLeading
-                )
-            }
-
-            if let target {
-                var guideline = Path()
-                let x = CGFloat(target) * scaleX
-                guideline.move(to: CGPoint(x: x, y: 0))
-                guideline.addLine(to: CGPoint(x: x, y: size.height))
-                context.stroke(
-                    guideline,
-                    with: .color(.red.opacity(0.6)),
-                    style: StrokeStyle(lineWidth: 1, dash: [3, 3])
-                )
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .accessibilityLabel(shifted ? "Waveforms after alignment" : "Waveforms as recorded")
     }
 }
