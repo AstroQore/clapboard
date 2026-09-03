@@ -35,8 +35,10 @@ Lane  (input strip)             Bus  (virtual track / group)
   destinationBus: UUID            outputChannelOffset: Int     <- first channel on that device
 ```
 
-- `LaneSource` is `.device(uid, channels)` today; `.processTap(...)` is added
-  by the process-tap milestone without touching the rest of this model.
+- `LaneSource` is `.device(uid, channels)` or `.processTap(TapSpec)`. Both
+  resolve to a source key plus channel indices, so nothing else in this model —
+  routing, solo scope, PDC, the console — distinguishes them
+  (`docs/ARCHITECTURE.md` § Process taps as lane sources).
 - Exactly one bus is created by default and named `Master`; nothing else is
   special about it. Deleting the last bus is refused. Deleting a bus re-routes
   its inputs to the bus it was sending to (or to the first remaining bus).
@@ -167,8 +169,10 @@ the point:
   whole row lines up, with the gain and peak read-outs under them;
 - `M` and `S`.
 
-A **lane strip** adds: the source device as a menu (`setLaneSource`) with its
-channel underneath, the destination bus picker, the delay in ms with ±0.1 ms
+A **lane strip** adds: the source as a menu (`setLaneSource`) — every usable
+input device with its channels, then an "Application audio" submenu listing
+"System audio" and the applications the HAL currently reports as playing — with
+the channel (or `tap · stereo`) underneath, the destination bus picker, the delay in ms with ±0.1 ms
 steppers and the `N sp` / `PDC +N sp` read-outs, polarity `Ø`, and remove.
 
 A **bus strip** adds: the parent bus picker (including "→ none"), the output

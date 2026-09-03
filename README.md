@@ -24,6 +24,7 @@ clap on every lane and writes the compensating delay into each one.
 | M6 Virtual audio devices (Clapboard Bus 1…4, Core Audio HAL driver) | done — needs an install + coreaudiod restart to confirm on this Mac |
 | M7 Bus routing: model, RT graph, multi-output aggregate, session format 2 | done |
 | M8 Console UI: vertical strips, per-strip routing, scoped solo, per-bus output | done — per-bus effect editing is still Master-only |
+| M9 Process taps as lane sources (capture another app, or all system audio) | done — the audio-capture permission was never enforced on the development Mac; see `docs/PERMISSIONS.md` |
 
 ## Build
 
@@ -49,9 +50,20 @@ whole capture path can be checked from a script:
     --rebuild-at 20 --hot-lane "Mic Mix"
 ```
 
-It exits non-zero if an aggregate device survives the teardown. Add
-`--ignore-tcc` to exercise everything except real capture on a machine where
-the microphone prompt has not been answered.
+It exits non-zero if an aggregate device — or a process tap — survives the
+teardown. Add `--ignore-tcc` to exercise everything except real capture on a
+machine where the microphone prompt has not been answered.
+
+`--list-taps` prints whether this build may capture system audio and every
+application the HAL currently reports as playing, and `--lane-tap
+<bundle-id|system>` adds a lane fed by a process tap instead of an input
+device (`#mono` after it asks for a mono mixdown):
+
+```sh
+.build/Clapboard.app/Contents/MacOS/Clapboard --list-taps
+.build/Clapboard.app/Contents/MacOS/Clapboard --engine-test 10 --output "Loopback" \
+    --lane "MacBook Pro Microphone" --lane-tap system
+```
 
 `--lane-effect <name-or-id>` inserts an Audio Unit into the lane named by the
 preceding `--lane`, `--master-effect` into the master chain, and `--bypass-at
@@ -277,6 +289,9 @@ $BIN --hotkeys-selftest                 # register every binding, report per bin
 $BIN --hotkeys-selftest --hotkeys-path /tmp/hotkeys.json --reset
 $BIN --engine-test 10 --output Loopback --lane "MacBook Pro Microphone" --bus Vocals --route "MacBook Pro Microphone"=Vocals
 $BIN --routing-selftest
+$BIN --list-taps                        # tappable apps + whether system-audio capture is allowed
+$BIN --engine-test 10 --output Loopback --lane "MacBook Pro Microphone" --lane-tap system
+$BIN --engine-test 10 --output Loopback --lane-tap com.apple.Music#mono
 ```
 
 `--hotkeys-selftest` loads the hotkey file (writing the default set when there
@@ -342,7 +357,7 @@ Scripts/install_driver.sh     validate and install (or print what to run)
 
 See the Status table above for what's implemented; `docs/ARCHITECTURE.md`
 marks planned-but-not-implemented items (bus routing, hotkeys, a
-virtual-device driver, process taps) explicitly so this README doesn't have
+virtual-device driver) explicitly so this README doesn't have
 to be re-checked against the code to know what's real.
 
 **The virtual-device driver is planned, not implemented.** When it lands, it

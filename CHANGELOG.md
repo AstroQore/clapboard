@@ -61,6 +61,31 @@ yet.
   `--bus`/`--route`/`--bus-parent`/`--bus-output`/`--solo`/`--mute` on
   `--engine-test`, and `--routing-selftest`, which builds a two-output-device
   bus tree and checks it end to end.
+- **Process taps as lane sources** (`docs/ARCHITECTURE.md` § Process taps as
+  lane sources): a lane can be fed by another application's audio — or by
+  everything this Mac plays — through macOS 14.2's
+  `AudioHardwareCreateProcessTap`, with no Loopback, no Audio Hijack and no
+  driver in between. A lane's source is now a `LaneSource`
+  (`.device(uid:channels:)` or `.processTap(TapSpec)`); `TapSpec` names an app
+  by bundle id or says "system audio", because HAL process object ids are not
+  stable across a relaunch. `LaneConfig.deviceUID`/`deviceChannels` stay as
+  computed shims over it, so Auto Sync, the row mixer and everything keyed on a
+  lane id keep working unchanged. Taps are created by `ProcessTapFactory`, join
+  the one private aggregate device through `kAudioAggregateDeviceTapListKey`,
+  and get their buffer index and channel offset from the aggregate's real
+  stream configuration — checked on every bring-up, never assumed. Session
+  format 2 is unchanged: `source` is additive and a file written before this
+  loads as a device lane. Every tap uses `CATapUnmuted`, so capturing an app
+  never silences it, and a system-wide tap excludes Clapboard itself so the mix
+  cannot feed back into a lane. A tap that will not build — the app is not
+  playing, or macOS refuses the capture — leaves the rest of the mix running
+  and reports the reason on the lane (`AudioEngine.laneStatusReason`) instead of
+  capturing silence. New UI: an "Application audio" tab in the Add Lane sheet
+  and an "Application audio" submenu in the console lane strip's source menu.
+  New headless flags: `--list-taps`, and `--lane-tap <bundle-id|system>` for
+  `--engine-test`. The permission is a separate TCC service with no
+  `requestAccess` API — see `docs/PERMISSIONS.md`, including what was and was
+  not actually enforced on the development Mac.
 
 ### Known limitations
 
@@ -72,8 +97,13 @@ yet.
   placeholder rather than a live plug-in (`docs/ROUTING.md`).
 - Projects (Save As / Open / Open Recent / a dirty-state title bar) are
   designed in `docs/ROUTING.md` but not implemented.
-- Global hotkeys, a virtual-device driver, and process-tap system-audio
-  capture are planned but not implemented yet — see `docs/ARCHITECTURE.md`.
+- A process-tap lane is not classified as "virtual" by Auto Sync: it is
+  offered and treated as a physical lane, because `SyncSession` decides that by
+  looking the lane's key up in the device registry. Untick a tap lane before
+  measuring — it cannot hear a clap.
+- A tap lane whose application is not playing when the engine starts stays
+  silent until the app starts playing (which rebuilds the aggregate) — a tap
+  cannot be added to a live aggregate device.
 - No signed/notarized release build exists; see `SECURITY.md`.
 
 [Unreleased]: https://github.com/AstroQore/clapboard/commits/main
