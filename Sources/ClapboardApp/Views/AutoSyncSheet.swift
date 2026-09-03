@@ -258,6 +258,8 @@ struct AutoSyncSheet: View {
                         verifications: session.verifications
                     )
 
+                    SyncMeasurementDetail(result: result)
+
                     if let takes = session.takeEnvelopes {
                         SyncTakePanel(set: takes)
                     }

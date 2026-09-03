@@ -312,3 +312,24 @@ struct EnvelopeCorrelatorTests {
         #expect(EnvelopeCorrelator.envelope(samples: [0, 0], window: window, hop: hop).isEmpty)
     }
 }
+
+@Suite("Pair residual lookup")
+struct PairResidualTests {
+    @Test func residualIsFoundWhicheverWayThePairIsAsked() {
+        let a = UUID()
+        let b = UUID()
+        let pair = PairObservation(a: a, b: b, offsetSamples: 12, weight: 1, estimator: "waveform")
+        var result = SyncResult(referenceLaneID: nil, lanes: [], sampleRate: 48_000)
+        result.pairResiduals = [pair: 0.4]
+
+        #expect(result.pairResidual(for: pair) == 0.4)
+        // Asked the other way round the offset flips sign, so the residual has
+        // to as well or the detail view would report a sign that contradicts
+        // the offset next to it.
+        #expect(result.pairResidual(for: pair.reversed) == -0.4)
+        let unrelated = PairObservation(
+            a: UUID(), b: UUID(), offsetSamples: 0, weight: 1, estimator: "waveform"
+        )
+        #expect(result.pairResidual(for: unrelated) == nil)
+    }
+}

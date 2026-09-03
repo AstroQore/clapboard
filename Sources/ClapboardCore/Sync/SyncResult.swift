@@ -189,6 +189,14 @@ public struct SyncResult: Sendable {
     public var pairs: [PairObservation] = []
     /// Pairs the fit rejected as inconsistent with the rest.
     public var droppedPairs: [PairObservation] = []
+    /// How far each surviving pair sits from the fitted arrival times, in
+    /// samples. Empty when no fit ran.
+    public var pairResiduals: [PairObservation: Double] = [:]
+
+    /// Residual of one pair, whichever way round it is asked for.
+    public func pairResidual(for pair: PairObservation) -> Double? {
+        pairResiduals[pair] ?? pairResiduals[pair.reversed].map { -$0 }
+    }
 
     /// Legacy: the lane the old single-reference estimator measured against.
     /// Arrivals no longer depend on one lane, so this is only kept for
