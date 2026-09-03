@@ -20,7 +20,7 @@ clap on every lane and writes the compensating delay into each one.
 | M2 Per-lane gain / switch / delay / polarity, meters | done |
 | M3 Auto Sync (onset detection + band-limited GCC-PHAT) | planned |
 | M4 Audio Unit hosting with latency compensation | planned |
-| M5 Session persistence, missing-device handling | planned |
+| M5 Session persistence, missing-device handling | done |
 
 ## Build
 
@@ -52,6 +52,46 @@ the microphone prompt has not been answered.
 
 Always run the `.app`, never `swift run`: microphone access is granted to a
 bundle identifier, and a bare executable has none.
+
+## Session file
+
+Clapboard remembers its mixer in
+`~/Library/Application Support/Clapboard/session.json`: every lane (device UID,
+channels, name, gain, on/off, polarity, delay — and their order), the output
+device, and the master gain. Meters and run state are not part of it.
+
+It is written one second after the last change, and again on quit and before
+sleep, so dragging a fader costs one write rather than sixty. Writes are
+atomic — a temporary file in the same directory, renamed over the old one — so
+a crash or a full disk mid-save leaves the previous session intact instead of a
+truncated file. A file that does not parse is never discarded: it is renamed to
+`session.json.corrupt-<timestamp>`, the failure is reported, and the app starts
+empty.
+
+A lane whose device is not plugged in is **kept** exactly as it was saved. It
+reports `deviceMissing`, the rest of the mix runs without it, and it rebinds by
+itself when the device comes back. Lane ids survive a relaunch, so anything
+keyed on them — M3's measured delays, M4's plug-in state — stays attached to the
+right lane.
+
+The format is deliberately tolerant, because a session file outlives the build
+that wrote it and may be edited by hand: unknown keys are ignored, missing
+fields fall back to their defaults, one unreadable lane does not take the other
+lanes down with it, and a `formatVersion` from a newer Clapboard is reported
+rather than refused.
+
+Headless:
+
+```sh
+Clapboard --session-dump                       # print the current session file
+Clapboard --engine-test 5 --output "Loopback" --lane "MacBook Pro Microphone" \
+    --save-session --session-path /tmp/session.json
+Clapboard --restore-session /tmp/session.json --run 5
+```
+
+`--restore-session` loads a file into a fresh engine, prints the lanes it got
+back — including which ones point at devices that are not here — and runs the
+engine for a few seconds, so the lane statuses are measured rather than assumed.
 
 ## Microphone permission and code signing
 

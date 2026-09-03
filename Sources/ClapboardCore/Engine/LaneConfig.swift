@@ -73,3 +73,55 @@ public enum Decibels {
         linear > 1e-7 ? 20 * log10f(linear) : -Float.infinity
     }
 }
+
+// MARK: - Persistence
+
+/// Session files outlive the build that wrote them and may be edited by hand,
+/// so decoding is deliberately forgiving: only `deviceUID` is required, every
+/// other field falls back to the default the memberwise initialiser uses, and
+/// unknown keys are ignored. That is what lets a lane written by a newer
+/// Clapboard — with, say, an effect chain attached — still load here.
+///
+/// `id` is encoded and restored so that data keyed on it (M3 sync results, M4
+/// plug-in state) stays attached to the same lane across relaunches.
+extension LaneConfig: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case id, deviceUID, deviceChannels, name, gainDB, enabled, polarityInverted, delaySamples
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let deviceUID = try container.decode(String.self, forKey: .deviceUID)
+        self.init(
+            id: container.lenient(UUID.self, .id, UUID()),
+            deviceUID: deviceUID,
+            deviceChannels: LaneConfig.sanitized(
+                channels: container.lenient([Int].self, .deviceChannels, [0])
+            ),
+            name: container.lenient(String.self, .name, deviceUID),
+            gainDB: container.lenient(Float.self, .gainDB, 0),
+            enabled: container.lenient(Bool.self, .enabled, true),
+            polarityInverted: container.lenient(Bool.self, .polarityInverted, false),
+            delaySamples: container.lenient(Int.self, .delaySamples, 0)
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(deviceUID, forKey: .deviceUID)
+        try container.encode(deviceChannels, forKey: .deviceChannels)
+        try container.encode(name, forKey: .name)
+        try container.encode(gainDB, forKey: .gainDB)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(polarityInverted, forKey: .polarityInverted)
+        try container.encode(delaySamples, forKey: .delaySamples)
+    }
+
+    /// A lane always drives at least one channel; negative indices and a third
+    /// channel are edits the render kernel cannot honour.
+    static func sanitized(channels: [Int]) -> [Int] {
+        let cleaned = channels.filter { $0 >= 0 }.prefix(2)
+        return cleaned.isEmpty ? [0] : Array(cleaned)
+    }
+}

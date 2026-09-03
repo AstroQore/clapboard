@@ -113,7 +113,14 @@ public final class AudioEngine {
 
     @discardableResult
     public func addLane(deviceUID: String, deviceChannels: [Int], name: String) -> LaneConfig {
-        let lane = LaneConfig(deviceUID: deviceUID, deviceChannels: deviceChannels, name: name)
+        addLane(LaneConfig(deviceUID: deviceUID, deviceChannels: deviceChannels, name: name))
+    }
+
+    /// Adds a lane whose identity is already decided — session restore, where
+    /// keeping `LaneConfig.id` is what keeps per-lane data (M3 sync results,
+    /// M4 plug-in state) attached to the right lane across a relaunch.
+    @discardableResult
+    public func addLane(_ lane: LaneConfig) -> LaneConfig {
         lanes.append(lane)
         host.runtime(for: lane.id)
         pushParameters(lane)
@@ -338,7 +345,7 @@ public final class AudioEngine {
 
     private func makeDependencyFingerprint() -> [String] {
         let uids = orderedInputDeviceUIDs() + (outputDeviceUID.map { [$0] } ?? [])
-        let known = registry?.devices ?? ((try? AudioDeviceInfo.enumerateAll()) ?? [])
+        let known = knownDevices()
         return uids.map { uid in
             guard let device = known.first(where: { $0.uid == uid }) else { return "\(uid)|gone" }
             return "\(uid)|\(device.inputStreamChannels)|\(device.outputStreamChannels)"
@@ -464,14 +471,31 @@ public final class AudioEngine {
         }
     }
 
+    /// Lane source devices, in lane order, without duplicates.
+    ///
+    /// Lanes whose device is not plugged in right now are skipped: the
+    /// aggregate cannot carry a device that is not there, and refusing to
+    /// build one would take the whole mix down because a single microphone is
+    /// missing — the case a restored session hits every time. Such a lane
+    /// stays in `lanes`, reports `.deviceMissing`, and rebinds by itself when
+    /// the device comes back: this list changes shape, so the dependency
+    /// fingerprint changes and `handleHardwareChange` rebuilds.
     private func orderedInputDeviceUIDs() -> [String] {
+        let present = Set(knownDevices().map(\.uid))
         var seen = Set<String>()
         var result: [String] = []
-        for lane in lanes where !seen.contains(lane.deviceUID) && lane.deviceUID != outputDeviceUID {
+        for lane in lanes
+        where !seen.contains(lane.deviceUID)
+            && lane.deviceUID != outputDeviceUID
+            && present.contains(lane.deviceUID) {
             seen.insert(lane.deviceUID)
             result.append(lane.deviceUID)
         }
         return result
+    }
+
+    private func knownDevices() -> [AudioDeviceInfo] {
+        registry?.devices ?? ((try? AudioDeviceInfo.enumerateAll()) ?? [])
     }
 
     private func republishGraph() {

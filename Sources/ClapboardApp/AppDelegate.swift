@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         didSet { installWorkspaceObservers() }
     }
 
+    /// Set by the scene alongside `engine`. Autosave is debounced, so quit and
+    /// sleep have to flush it explicitly.
+    var session: SessionController?
+
     private var observersInstalled = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -17,6 +21,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if CommandLine.arguments.contains("--engine-test") {
             EngineSmokeTest.run(arguments: Array(CommandLine.arguments.dropFirst()))
+        }
+        if CommandLine.arguments.contains("--restore-session")
+            || CommandLine.arguments.contains("--session-dump")
+            || CommandLine.arguments.contains("--session-autosave-test") {
+            SessionSmokeTest.run(arguments: Array(CommandLine.arguments.dropFirst()))
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
@@ -29,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Last chance to destroy the private aggregate device. Leaving one behind
     /// would keep every sub-device open.
     func applicationWillTerminate(_ notification: Notification) {
+        session?.flush()
         engine?.shutdown()
     }
 
@@ -41,7 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         center.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.engine?.handleWillSleep() }
+            MainActor.assumeIsolated {
+                // Write before the machine goes down: a sleep that turns into a
+                // power loss must not cost the session.
+                self?.session?.flush()
+                self?.engine?.handleWillSleep()
+            }
         }
         center.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
