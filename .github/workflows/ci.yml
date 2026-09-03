@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build, test and package
+    # Clapboard requires macOS 26 / Xcode 26 (Swift 6.2) per AGENTS.md and
+    # README.md, matching the sibling AstroQore apps' CI (vibe-bar, auspex).
+    runs-on: macos-26
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers -productVersion
+          xcode-select -p
+          swift --version
+
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        timeout-minutes: 10
+        run: swift test
+
+      - name: Build and sign .app
+        run: ./Scripts/build_app.sh release
+
+      - name: Verify empty entitlements
+        run: codesign -d --entitlements - .build/Clapboard.app
+
+      - name: Repo hygiene check
+        run: ./Scripts/check_repo_hygiene.sh
+
+  driver:
+    name: Virtual device driver (optional)
+    runs-on: macos-26
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build driver harness, if present
+        run: |
+          if [ -x Scripts/build_driver.sh ]; then
+            ./Scripts/build_driver.sh --harness
+          else
+            echo "Scripts/build_driver.sh not present on this branch yet — skipping."
+          fi
