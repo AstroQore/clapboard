@@ -1,0 +1,19 @@
+#!/bin/bash
+# Runs as root from the ClapboardDriver uninstaller package, which carries no
+# payload of its own: all of the work happens here.
+set -u
+
+DRIVER="/Library/Audio/Plug-Ins/HAL/ClapboardDriver.driver"
+
+if [ -d "$DRIVER" ]; then
+    rm -rf "$DRIVER"
+fi
+
+/usr/sbin/pkgutil --forget com.astroqore.ClapboardDriver >/dev/null 2>&1 || true
+/usr/sbin/pkgutil --forget com.astroqore.ClapboardDriver.uninstaller >/dev/null 2>&1 || true
+
+if ! /bin/launchctl kickstart -kp system/com.apple.audio.coreaudiod; then
+    /usr/bin/killall coreaudiod || true
+fi
+
+exit 0

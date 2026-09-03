@@ -21,6 +21,7 @@ clap on every lane and writes the compensating delay into each one.
 | M3 Auto Sync (onset detection + band-limited GCC-PHAT, results sheet, verify) | done — acoustic accuracy still to be confirmed with a real clap |
 | M4 Audio Unit hosting with latency compensation | in progress |
 | M5 Session persistence, missing-device handling | done |
+| M6 Virtual audio devices (Clapboard Bus 1…4, Core Audio HAL driver) | done — needs an install + coreaudiod restart to confirm on this Mac |
 
 ## Build
 
@@ -52,6 +53,35 @@ the microphone prompt has not been answered.
 
 Always run the `.app`, never `swift run`: microphone access is granted to a
 bundle identifier, and a bare executable has none.
+
+## Virtual devices
+
+Clapboard ships its own Core Audio driver, so the mix can be handed to OBS,
+Zoom, Audio Hijack or QuickTime without Loopback on the output side. It
+publishes four loopback devices — **Clapboard Bus 1** … **Clapboard Bus 4** —
+each 2-channel Float32 at 48 kHz (44.1 and 96 kHz are also offered). Whatever
+an app plays to a bus, another app captures from the same bus.
+
+```sh
+./Scripts/build_driver.sh release            # -> .build/ClapboardDriver.driver
+./Scripts/build_driver.sh release --harness  # + 253 offline checks, no coreaudiod
+./Scripts/build_driver_pkg.sh                # -> .build/ClapboardDriver.pkg
+open .build/ClapboardDriver.pkg              # Installer.app asks for the password
+```
+
+Installing restarts `coreaudiod`, which drops every audio app's device
+connections for a moment. `./Scripts/install_driver.sh` validates the bundle and
+prints exactly what will happen without doing it; `./Scripts/uninstall_driver.sh`
+and `./Scripts/build_driver_uninstaller_pkg.sh` undo it.
+
+The devices are keyed by UID — `com.astroqore.Clapboard.bus.<n>`, model UID
+`com.astroqore.Clapboard.bus` — so the app's device registry recognises them
+without a special case. Because reading a bus consumes it, plan on one bus per
+capturing app.
+
+`Driver/README.md` has the object model, the ring/timeline arithmetic, the test
+harness and the signing/notarisation steps.
+
 
 ## Session file
 
@@ -154,7 +184,13 @@ Sources/ClapboardCore/Sync    onset detection, GCC-PHAT, clap aligner        (M3
 Sources/ClapboardCore/AU      Audio Unit catalog and host                    (M4)
 Sources/ClapboardCore/Session JSON session document                          (M5)
 Sources/ClapboardApp          app entry, controllers, views
+Driver/Sources               ClapboardDriver.driver, a Core Audio AudioServerPlugIn (M6)
+Driver/Harness               offline driver tests — no coreaudiod, no install
+Driver/Packaging             pkgbuild/productbuild scripts and installer resources
 Scripts/build_app.sh          bundle + sign .build/Clapboard.app
+Scripts/build_driver.sh       build + sign + test .build/ClapboardDriver.driver
+Scripts/build_driver_pkg.sh   wrap the driver into .build/ClapboardDriver.pkg
+Scripts/install_driver.sh     validate and install (or print what to run)
 ```
 
 ## License
