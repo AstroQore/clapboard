@@ -18,8 +18,8 @@ clap on every lane and writes the compensating delay into each one.
 | M0 Scaffold, device list, hot-plug | done |
 | M1 Multi-device capture + mix + output (private aggregate device, HAL IOProc) | done |
 | M2 Per-lane gain / switch / delay / polarity, meters | done |
-| M3 Auto Sync (onset detection + band-limited GCC-PHAT) | planned |
-| M4 Audio Unit hosting with latency compensation | planned |
+| M3 Auto Sync (onset detection + band-limited GCC-PHAT, results sheet, verify) | done — acoustic accuracy still to be confirmed with a real clap |
+| M4 Audio Unit hosting with latency compensation | in progress |
 | M5 Session persistence, missing-device handling | done |
 
 ## Build
@@ -92,6 +92,28 @@ Clapboard --restore-session /tmp/session.json --run 5
 `--restore-session` loads a file into a fresh engine, prints the lanes it got
 back — including which ones point at devices that are not here — and runs the
 engine for a few seconds, so the lane statuses are measured rather than assumed.
+
+## Headless commands
+
+The executable doubles as a command-line tool. These flags are dispatched in
+`main.swift` before AppKit starts, so they work from a shell and never open a
+window:
+
+```sh
+BIN=.build/Clapboard.app/Contents/MacOS/Clapboard
+$BIN --list-devices
+$BIN --engine-test 20 --output Loopback --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" --rebuild-at 8 --hot-lane "监听"
+$BIN --sync-test 8 --output Loopback --lane "Wireless Mic Rx" --lane "MacBook Pro Microphone" --apply   # clap when it says CLAP NOW
+$BIN --engine-test 5 --output Loopback --lane "MacBook Pro Microphone" --save-session --session-path /tmp/s.json
+$BIN --restore-session /tmp/s.json --run 3
+$BIN --session-dump
+$BIN --session-autosave-test
+```
+
+Every mode destroys its private aggregate device on exit, including on
+SIGTERM / SIGINT (`pkill`, Ctrl-C). Do not `kill -9` a running instance: a
+process that dies with its aggregate registered can leave coreaudiod unable
+to accept new clients until it is restarted (`sudo killall coreaudiod`).
 
 ## Microphone permission and code signing
 

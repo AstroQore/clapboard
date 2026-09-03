@@ -89,6 +89,7 @@ public final class AudioEngine {
     public init() {
         host.setMeterDecay(framesPerBlock: 256, sampleRate: 48_000)
         refreshAuthorization()
+        TerminationGuard.register(self)
     }
 
     deinit {
