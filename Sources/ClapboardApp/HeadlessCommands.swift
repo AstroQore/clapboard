@@ -13,7 +13,8 @@ enum HeadlessCommand {
         "--session-dump",
         "--session-autosave-test",
         "--hotkeys-selftest",
-        "--routing-selftest"
+        "--routing-selftest",
+        "--list-taps"
     ]
 
     static func matches(_ arguments: [String]) -> Bool {
@@ -24,6 +25,9 @@ enum HeadlessCommand {
     static func run(_ arguments: [String]) -> Never {
         if arguments.contains("--list-devices") {
             printDevicesAndExit()
+        }
+        if arguments.contains("--list-taps") {
+            printTapsAndExit()
         }
         if arguments.contains("--effects-list") {
             printEffectsAndExit()
@@ -81,6 +85,32 @@ enum HeadlessCommand {
         case MachOArchitecture.x86_64: return "x86_64"
         default: return String(format: "0x%08x", cpuType)
         }
+    }
+
+    /// Dumps everything a process-tap lane could be pointed at: whether macOS
+    /// lets this build tap at all, and every client process the HAL reports as
+    /// producing (or capable of producing) audio.
+    ///
+    /// The permission line comes first on purpose. Checking it means creating
+    /// and destroying a real tap (`ProcessTapPermission`), which is also the
+    /// only way to *ask* for the permission, so running `--list-taps` once is
+    /// how a script gets the prompt out of the way.
+    private static func printTapsAndExit() -> Never {
+        let authorization = ProcessTapPermission.probe()
+        print("system-audio-capture\t\(authorization.label)")
+        print("system\t-\t-\tSystem audio (everything except Clapboard)")
+        let processes = ProcessTapCatalog.outputProducingProcesses()
+        for process in processes {
+            var flags: [String] = []
+            if process.isRunningOutput { flags.append("playing") }
+            else if process.isRunning { flags.append("audio-io") }
+            if process.bundleID == nil { flags.append("no-bundle-id: cannot be saved in a session") }
+            print("\(process.bundleID ?? "-")\tpid=\(process.pid)\tobj=\(process.objectID)\t\(process.name)"
+                + (flags.isEmpty ? "" : "\t[\(flags.joined(separator: " "))]"))
+        }
+        print("\(processes.count) tappable process(es)")
+        print("leftover taps: \(ProcessTapFactory.leakedTapUIDs().count)")
+        exit(authorization.isAuthorized ? 0 : 3)
     }
 
     /// Dumps every Core Audio device the HAL reports and exits.

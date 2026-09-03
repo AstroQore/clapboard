@@ -43,13 +43,33 @@ import Foundation
 ///     Clapboard --engine-test 10 --output Loopback \
 ///         --lane "MacBook Pro Microphone" --bus Vocals \
 ///         --route "MacBook Pro Microphone"=Vocals --lane "Audio Hijack Input"
+///
+/// M9: `--lane-tap <bundle-id|system>` adds a lane fed by a Core Audio process
+/// tap instead of an input device — `system` for everything this Mac plays
+/// (except Clapboard), a bundle id for one application. `#mono` after it makes
+/// the tap a mono mixdown. `--list-taps` prints what is tappable right now:
+///
+///     Clapboard --engine-test 10 --output Loopback \
+///         --lane "MacBook Pro Microphone" --lane-tap system
 enum EngineSmokeTest {
+    /// One `--lane`/`--lane-tap` on the command line, in the order it appeared.
+    enum LaneRequest {
+        case device(query: String)
+        case tap(query: String)
+
+        var query: String {
+            switch self {
+            case .device(let query), .tap(let query): return query
+            }
+        }
+    }
+
     @MainActor
     static func run(arguments: [String]) -> Never {
         var seconds = 10.0
         var outputQuery: String?
-        var laneQueries: [String] = []
-        /// Effects to insert into each lane, parallel to `laneQueries`.
+        var laneRequests: [LaneRequest] = []
+        /// Effects to insert into each lane, parallel to `laneRequests`.
         var laneEffectQueries: [[String]] = []
         var masterEffectQueries: [String] = []
         var busNames: [String] = []
@@ -77,7 +97,12 @@ enum EngineSmokeTest {
             case "--output": outputQuery = next()
             case "--lane":
                 if let value = next() {
-                    laneQueries.append(value)
+                    laneRequests.append(.device(query: value))
+                    laneEffectQueries.append([])
+                }
+            case "--lane-tap":
+                if let value = next() {
+                    laneRequests.append(.tap(query: value))
                     laneEffectQueries.append([])
                 }
             // Attaches to the most recent `--lane`, so the flag order on the
@@ -123,15 +148,38 @@ enum EngineSmokeTest {
 
         var laneIDs: [UUID] = []
         var laneIDsByQuery: [String: UUID] = [:]
-        for query in laneQueries {
+        var wantsTaps = false
+        for request in laneRequests {
+            let query = request.query
             // "Device Name#2" takes channel 2, "Device Name#1,2" the stereo
-            // pair. A bare name takes channel 1. `#` rather than `:` because
-            // device UIDs are full of colons.
+            // pair; for a tap, "#mono" asks for a mono mixdown. A bare name
+            // takes channel 1 / a stereo tap. `#` rather than `:` because
+            // device UIDs and bundle ids are full of colons and dots.
             let parts = query.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
             let name = String(parts[0])
-            let channels: [Int] = parts.count > 1
-                ? parts[1].split(separator: ",").compactMap { Int($0).map { $0 - 1 } }
-                : [0]
+            let qualifier = parts.count > 1 ? String(parts[1]) : nil
+
+            if case .tap = request {
+                wantsTaps = true
+                let mono = qualifier?.lowercased() == "mono"
+                let spec: TapSpec
+                if name.lowercased() == "system" {
+                    spec = TapSpec(target: .systemAudio, name: "System audio", mono: mono)
+                } else {
+                    let display = ProcessTapCatalog.outputProducingProcesses()
+                        .first { $0.bundleID == name }?.name ?? name
+                    spec = TapSpec(target: .app(bundleID: name), name: display, mono: mono)
+                }
+                let lane = engine.addTapLane(spec)
+                laneIDs.append(lane.id)
+                laneIDsByQuery[query] = lane.id
+                say("lane-tap \(spec.name) [\(spec.sourceKey)] \(mono ? "mono" : "stereo")")
+                continue
+            }
+
+            let channels: [Int] = qualifier.map {
+                $0.split(separator: ",").compactMap { Int($0).map { $0 - 1 } }
+            } ?? [0]
             guard let device = resolve(name), device.hasInput else {
                 fail("--lane \(name) did not resolve to an input device")
             }
@@ -258,6 +306,12 @@ enum EngineSmokeTest {
             engine.allowsUnauthorizedCapture = true
             say("mic TCC  bypassed for diagnostics — lane input will be zeros unless TCC is granted")
         }
+        // The system-audio-capture permission is a different TCC service with
+        // no query-only API, so checking it means building a tap; only do that
+        // when a lane actually wants one.
+        if wantsTaps {
+            say("tap TCC  \(engine.refreshSystemAudioAuthorization().label)")
+        }
 
         let started = Date()
         engine.start()
@@ -306,6 +360,11 @@ enum EngineSmokeTest {
             }
             say("         " + busPDCLine(engine))
             say("         " + outputLatencyLine(engine))
+            // A lane that is not contributing says why, once. Silence with a
+            // reason beside it is a result; silence on its own is a mystery.
+            for lane in engine.lanes where engine.laneStatus[lane.id]?.isProblem == true {
+                say("LANE     \(short(lane.name)): \(engine.laneStatusReason[lane.id] ?? "source missing")")
+            }
 
             if let bypassAt, !didBypass, elapsed >= bypassAt {
                 didBypass = true
@@ -377,11 +436,17 @@ enum EngineSmokeTest {
         engine.shutdown()
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
 
-        // Nothing of ours may survive the teardown.
+        // Nothing of ours may survive the teardown — neither the private
+        // aggregate nor any tap it carried. `leakedTapUIDs` is not
+        // bookkeeping: it intersects the taps this process created and never
+        // destroyed with the HAL's own tap list.
         let leftovers = ((try? AudioDeviceInfo.enumerateAll()) ?? [])
             .filter { $0.uid.hasPrefix("com.astroqore.Clapboard.aggregate.") || $0.name == "Clapboard Mix" }
+        let leakedTaps = ProcessTapFactory.leakedTapUIDs()
         say("leftover aggregates after shutdown: \(leftovers.count)")
-        exit(leftovers.isEmpty ? 0 : 2)
+        say("leftover taps after shutdown: \(leakedTaps.count)"
+            + (leakedTaps.isEmpty ? "" : " \(leakedTaps)"))
+        exit(leftovers.isEmpty && leakedTaps.isEmpty ? 0 : 2)
     }
 
     // MARK: - Effects
