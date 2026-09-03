@@ -25,6 +25,7 @@ enum SyncSmokeTest {
         var outputQuery: String?
         var laneQueries: [String] = []
         var takes = 1
+        var listen = 4.0
         var window = 0.25
         var relaxed = false
         var apply = false
@@ -48,6 +49,7 @@ enum SyncSmokeTest {
             case "--output": outputQuery = next()
             case "--lane": if let value = next() { laneQueries.append(value) }
             case "--takes": takes = Int(next() ?? "1") ?? 1
+            case "--listen": listen = Double(next() ?? "4") ?? 4
             case "--window": window = Double(next() ?? "0.25") ?? 0.25
             case "--relaxed": relaxed = true
             case "--apply": apply = true
@@ -117,19 +119,24 @@ enum SyncSmokeTest {
 
         let session = SyncSession(engine: engine, registry: registry)
         session.takeCount = takes
+        session.listenSeconds = listen
         session.maxLagSeconds = window
         session.relaxed = relaxed
         // The point of the headless run is to exercise every lane, including
         // the virtual ones the sheet leaves out by default.
         for lane in session.laneOptions { session.setIncluded(lane.id, true) }
         say(String(
-            format: "options  takes=%d window=±%.0f ms minPeakRatio=%.1f lanes=%d",
-            takes, window * 1000, session.syncOptions.minPeakRatio, session.selectedLanes.count
+            format: "options  takes=%d listen=%.0f s window=±%.0f ms minPeakRatio=%.1f "
+                + "minDominance=%.0f dB lanes=%d",
+            takes, session.boundedListenSeconds, window * 1000,
+            session.syncOptions.minPeakRatio, session.syncOptions.minDominanceDB,
+            session.selectedLanes.count
         ))
         say("")
         say(">>> CLAP ONCE, HARD, when the line below says LISTENING. <<<")
         say("    Nothing in this process can make the sound for you; with no clap")
-        say("    every lane is expected to come back \"not detected\".")
+        say("    every lane is expected to come back \"no dominant transient\" and")
+        say("    the take is expected to run the full listen window.")
         say("")
 
         let overloadsBefore = engine.overloadCount
@@ -140,7 +147,10 @@ enum SyncSmokeTest {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.2))
-            let line = describe(session.phase, progress: session.captureProgress)
+            let line = describe(
+                session.phase, progress: session.captureProgress,
+                remaining: session.listenSecondsRemaining
+            )
             if line != lastLine {
                 lastLine = line
                 say(String(format: "t=%5.1f  %@", Date().timeIntervalSince(started), line))
@@ -159,27 +169,32 @@ enum SyncSmokeTest {
         }
 
         say("")
-        say("capture  \(session.lastTakeRecordings.count) lanes, "
-            + String(format: "%.2f s each at %.0f Hz",
-                     session.lastTakeRecordings.first?.durationSeconds ?? 0, engine.sampleRate))
-        for recording in session.lastTakeRecordings {
-            var probe = SyncOnsetProbe(sampleRate: recording.sampleRate)
-            probe.append(recording.samples)
-            let peak = recording.samples.reduce(Float(0)) { max($0, abs($1)) }
-            var sum = 0.0
-            for value in recording.samples { sum += Double(value) * Double(value) }
-            let rms = recording.samples.isEmpty ? 0 : (sum / Double(recording.samples.count)).squareRoot()
+        say(String(
+            format: "take     %.2f s over %d lanes at %.0f Hz, %@ (%@)",
+            session.takeDuration, session.lastTakeRecordings.count, engine.sampleRate,
+            session.takeEndedEarly ? "ended early" as NSString : "ran the full listen window" as NSString,
+            session.takeEndReason as NSString
+        ))
+        say("levels   peak and median are 1 ms RMS windows; dominance is the gap between them")
+        for lane in result.lanes {
+            guard let levels = lane.levels else {
+                say(String(format: "  %-26@ not analysed", short(lane.label) as NSString))
+                continue
+            }
             say(String(
-                format: "  %-26@ peak=%7.2f dBFS  rms=%7.2f dBFS  floor=%7.2f dBFS  transient=%@",
-                short(recording.label) as NSString,
-                decibels(Double(peak)), decibels(rms), decibels(probe.noiseFloor),
-                probe.onsetSample.map { String(format: "yes at %.3f s", Double($0) / recording.sampleRate) } ?? "no"
+                format: "  %-26@ peak=%7.2f  median=%7.2f  floor=%7.2f dBFS  dominance=%5.1f dB  onset=%@  multi=%@",
+                short(lane.label) as NSString,
+                levels.peakDBFS, levels.medianDBFS, levels.noiseFloorDBFS, levels.dominanceDB,
+                (lane.onsetSample.map { String(format: "%.3f s", Double($0) / result.sampleRate) }
+                    ?? "none") as NSString,
+                (levels.multipleTransients ? "yes" : "no") as NSString
             ))
         }
 
         say("")
         say("result   reference=\(result.referenceLaneID.flatMap { id in result[id]?.label } ?? "none") "
             + "aligned=\(result.alignedLanes.count)/\(result.lanes.count)")
+        if let failure = result.failureSummary { say("FAILURE  \(failure)") }
         for lane in result.lanes {
             switch lane.status {
             case .aligned(let offset, let confidence, let ratio, let inverted):
@@ -245,12 +260,17 @@ enum SyncSmokeTest {
         exit(leftovers.isEmpty ? exitCode : 2)
     }
 
-    private static func describe(_ phase: SyncSession.Phase, progress: Double) -> String {
+    private static func describe(
+        _ phase: SyncSession.Phase, progress: Double, remaining: Double
+    ) -> String {
         switch phase {
         case .idle: return "idle"
         case .armed: return "ARMED — recording room tone, get ready"
         case .listening(let take, let total):
-            return String(format: "LISTENING (take %d/%d) %.0f%%", take, total, progress * 100)
+            return String(
+                format: "LISTENING (take %d/%d) %.0f%% — clap now, %.0f s left",
+                take, total, progress * 100, max(0, remaining.rounded(.up))
+            )
         case .analysing: return "analysing"
         case .results: return "results"
         case .verifying: return "verifying"

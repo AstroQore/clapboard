@@ -43,7 +43,9 @@ struct SyncInternalsTests {
             samples: take.lanes[1].samples, sampleRate: 48_000, options: options
         )
         #expect(musicAnalysis.onsetSample == nil)
-        #expect(musicAnalysis.failure == .noTransient)
+        // Loud, but never 20 dB louder than its own average: not a clap.
+        #expect(musicAnalysis.failure?.reason.contains("no dominant transient") == true)
+        #expect((musicAnalysis.dominanceDB ?? 99) < 20)
     }
 
     @Test("the noise floor ignores digitally silent frames")
@@ -139,5 +141,65 @@ struct SyncInternalsTests {
         let early = energy(preparation.anchor..<(preparation.anchor + 240))
         let late = energy((preparation.anchor + 240)..<(preparation.anchor + 480))
         #expect(early > late * 8, "early \(early) late \(late)")
+    }
+
+    // MARK: - A real room
+
+    @Test("in a busy room the onset is the clap, not the first burst",
+          arguments: [UInt64(1), 2, 3, 4, 5, 6])
+    func onsetDetectorFindsTheClapInARoom(seed: UInt64) {
+        let take = SyncTestSignals.makeRoomTake(
+            [SyncTestSignals.RoomLaneSpec("mic")], seed: seed
+        )
+        let analysis = OnsetDetector.analyze(
+            samples: take.lanes[0].samples,
+            sampleRate: SyncTestSignals.sampleRate,
+            options: options
+        )
+        #expect(analysis.failure == nil)
+        let onset = try! #require(analysis.onsetSample)
+        let error = Double(onset) - take.clapPosition
+        #expect(abs(error) <= 48, "onset off by \(error) samples")
+        #expect((analysis.dominanceDB ?? 0) >= 20, "dominance \(analysis.dominanceDB ?? 0) dB")
+        #expect(analysis.multipleTransients == false)
+    }
+
+    @Test("the same room without a clap has no onset at all",
+          arguments: [UInt64(1), 2, 3, 4, 5, 6])
+    func onsetDetectorRefusesARoomWithNoClap(seed: UInt64) {
+        var spec = SyncTestSignals.RoomLaneSpec("mic")
+        spec.hasClap = false
+        let take = SyncTestSignals.makeRoomTake([spec], seed: seed)
+        let analysis = OnsetDetector.analyze(
+            samples: take.lanes[0].samples,
+            sampleRate: SyncTestSignals.sampleRate,
+            options: options
+        )
+        // Bursts 10-14 dB over the floor are exactly what the old rule fired
+        // on. They must not be onsets.
+        #expect(analysis.onsetSample == nil)
+        #expect((analysis.dominanceDB ?? 99) < 20, "dominance \(analysis.dominanceDB ?? 99) dB")
+        #expect(analysis.failure?.reason.contains("no dominant transient") == true)
+    }
+
+    @Test("two claps are noticed, and the loudest is the one used")
+    func onsetDetectorFlagsMoreThanOneTransient() {
+        var spec = LaneSpec("mic")
+        spec.snrdB = 30
+        let take = SyncTestSignals.makeTake([spec], seed: 8_642, clapPosition: 0.6 * 48_000)
+        var samples = take.lanes[0].samples
+        let second = take.clapPosition + 1.5 * 48_000
+        SyncTestSignals.add(
+            clap: SyncTestSignals.makeClap(seed: 99), to: &samples,
+            at: second, amplitude: SyncTestSignals.clapLevel * 1.5
+        )
+
+        let analysis = OnsetDetector.analyze(
+            samples: samples, sampleRate: 48_000, options: options
+        )
+        #expect(analysis.multipleTransients)
+        // The second clap is 3.5 dB louder, so it is the one that is measured.
+        let onset = try! #require(analysis.onsetSample)
+        #expect(abs(Double(onset) - second) <= 48, "onset off by \(Double(onset) - second)")
     }
 }

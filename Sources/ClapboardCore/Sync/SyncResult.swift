@@ -86,6 +86,47 @@ public enum LaneSyncStatus: Sendable, Equatable {
     }
 }
 
+/// What the 1 ms RMS envelope of one lane's take looked like.
+///
+/// The numbers behind the verdict, kept so the result page and `--sync-test`
+/// can say *why* a lane was refused instead of only that it was.
+public struct LaneLevels: Sendable, Equatable {
+    /// Loudest 1 ms window, dBFS.
+    public let peakDBFS: Double
+    /// Median 1 ms window of the whole take: what the room sounds like.
+    public let medianDBFS: Double
+    /// Median 1 ms window of the clap-free head.
+    public let noiseFloorDBFS: Double
+    /// `peakDBFS - medianDBFS`. A clap clears `SyncOptions.minDominanceDB`;
+    /// speech, keys and a bump do not.
+    public let dominanceDB: Double
+    /// Largest absolute sample value, dBFS.
+    public let samplePeakDBFS: Double
+    /// First sample of the loudest window.
+    public let peakSample: Int
+    /// Another maximum within 6 dB of the peak, more than 100 ms away: the
+    /// take holds more than one bang. The loudest is the one that was used.
+    public let multipleTransients: Bool
+
+    public init(
+        peakDBFS: Double,
+        medianDBFS: Double,
+        noiseFloorDBFS: Double,
+        dominanceDB: Double,
+        samplePeakDBFS: Double,
+        peakSample: Int,
+        multipleTransients: Bool
+    ) {
+        self.peakDBFS = peakDBFS
+        self.medianDBFS = medianDBFS
+        self.noiseFloorDBFS = noiseFloorDBFS
+        self.dominanceDB = dominanceDB
+        self.samplePeakDBFS = samplePeakDBFS
+        self.peakSample = peakSample
+        self.multipleTransients = multipleTransients
+    }
+}
+
 /// Auto Sync's verdict for a single lane.
 public struct LaneSyncResult: Sendable {
     public let laneID: UUID
@@ -104,6 +145,9 @@ public struct LaneSyncResult: Sendable {
     /// 0. `nil` when the lane was not detected.
     public let suggestedDelaySamples: Int?
     public let suggestedDelayMs: Double?
+    /// Envelope levels behind the verdict, `nil` only when the lane could not
+    /// be analysed at all (a mismatched sample rate, say).
+    public let levels: LaneLevels?
 
     public init(
         laneID: UUID,
@@ -113,7 +157,8 @@ public struct LaneSyncResult: Sendable {
         onsetSNRdB: Double?,
         clipped: Bool,
         suggestedDelaySamples: Int?,
-        suggestedDelayMs: Double?
+        suggestedDelayMs: Double?,
+        levels: LaneLevels? = nil
     ) {
         self.laneID = laneID
         self.label = label
@@ -123,6 +168,7 @@ public struct LaneSyncResult: Sendable {
         self.clipped = clipped
         self.suggestedDelaySamples = suggestedDelaySamples
         self.suggestedDelayMs = suggestedDelayMs
+        self.levels = levels
     }
 }
 
@@ -134,11 +180,24 @@ public struct SyncResult: Sendable {
     public let referenceLaneID: UUID?
     public let lanes: [LaneSyncResult]
     public let sampleRate: Double
+    /// Why the whole take is unusable, ready to show as-is. Set exactly when
+    /// `referenceLaneID` is `nil`: no two lanes heard the same clap, so there
+    /// is nothing to measure anything against and no delay may be written.
+    public let failureSummary: String?
 
-    public init(referenceLaneID: UUID?, lanes: [LaneSyncResult], sampleRate: Double) {
+    /// The one sentence that explains an Auto Sync take with no reference.
+    public static let noClapFailureSummary = "No clap was found on two or more lanes."
+
+    public init(
+        referenceLaneID: UUID?,
+        lanes: [LaneSyncResult],
+        sampleRate: Double,
+        failureSummary: String? = nil
+    ) {
         self.referenceLaneID = referenceLaneID
         self.lanes = lanes
         self.sampleRate = sampleRate
+        self.failureSummary = failureSummary
     }
 
     public subscript(laneID: UUID) -> LaneSyncResult? {
