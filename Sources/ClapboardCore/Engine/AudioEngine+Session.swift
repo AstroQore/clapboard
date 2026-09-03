@@ -186,47 +186,37 @@ extension AudioEngine {
                 if Task.isCancelled { return }
                 // The lane can be removed while an earlier plug-in loads.
                 if lane(id: entry.laneID) == nil { break }
-                await restoreOne(config, intoLane: entry.laneID)
+                await restoreOne(config, into: .lane(entry.laneID))
             }
         }
+        // Every bus, master or not: a chain on a bus is a live chain, on the
+        // same terms a lane's is. A placeholder here now means only what it
+        // means on a lane — the component is not installed, or macOS refused
+        // to host it — and never "this build has no API for that bus".
         for entry in wantedBuses {
             for config in entry.chain {
                 if Task.isCancelled { return }
                 guard bus(id: entry.busID) != nil else { break }
-                if entry.busID == masterBusID {
-                    // The master bus is `buses[_]` too, but this is the path
-                    // that already exists, is already tested, and already
-                    // keeps `masterEffects` (the shim) correct.
-                    await restoreOne(config, intoLane: nil)
-                } else {
-                    // Per-bus effect editing has no UI or engine API yet
-                    // (only the master bus's chain is ever edited today), so
-                    // a saved chain on any other bus is kept as a
-                    // placeholder — its state survives the round trip
-                    // unharmed, it is simply not live — rather than
-                    // instantiating a plug-in nothing can ever reach again.
-                    var placeholder = config
-                    placeholder.unavailableReason =
-                        "Per-bus effect chains cannot be edited yet; the saved state is kept."
-                    mutateBus(entry.busID) { $0.effects.append(placeholder) }
-                }
+                await restoreOne(config, into: .bus(entry.busID))
             }
         }
     }
 
-    private func restoreOne(_ config: EffectConfig, intoLane laneID: UUID?) async {
+    private func restoreOne(_ config: EffectConfig, into target: EffectTarget) async {
         guard let info = AUCatalog.find(id: config.componentID) else {
             var placeholder = config
             placeholder.unavailableReason = AUAvailability.missingComponent(config.componentID)
-            insertPlaceholder(placeholder, intoLane: laneID)
+            insertPlaceholder(placeholder, into: target)
             return
         }
         let channels: Int
-        if let laneID {
+        switch target {
+        case .lane(let laneID):
             guard let lane = lane(id: laneID) else { return }
             channels = max(1, min(2, lane.deviceChannels.count))
-        } else {
-            channels = 2
+        case .bus(let busID):
+            guard bus(id: busID) != nil else { return }
+            channels = AudioEngine.busEffectChannels
         }
         do {
             let instance = try await AUEffectInstance.instantiate(
@@ -242,12 +232,12 @@ extension AudioEngine {
             }
             var restored = config
             restored.displayName = info.displayName
-            insert(instance, config: restored, intoLane: laneID, at: nil)
+            insert(instance, config: restored, into: target, at: nil)
         } catch {
             var placeholder = config
             placeholder.displayName = info.displayName
             placeholder.unavailableReason = String(describing: error)
-            insertPlaceholder(placeholder, intoLane: laneID)
+            insertPlaceholder(placeholder, into: target)
         }
     }
 
