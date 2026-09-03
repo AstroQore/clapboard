@@ -52,11 +52,19 @@ final class BufferListBox {
 }
 
 /// One lane, one stereo output stream, driven block by block.
+///
+/// `publish` always names one bus — `masterBusID` — as every lane's
+/// destination, so the great majority of the render-kernel tests (written
+/// before buses existed) see exactly the single-bus shape they did before;
+/// `RoutingGraphTests`/`SoloLogicTests`/`LatencyPlanTests` exercise the
+/// multi-bus tree at the model layer, and `RenderKernelBusTests` below
+/// exercises it through the render kernel itself.
 final class Rig {
     let host = RTEngineHost()
     let input: BufferListBox
     let output: BufferListBox
     let frames: Int
+    let masterBusID = UUID()
     private(set) var laneIDs: [UUID] = []
 
     init(inputStreams: [Int], frames: Int = 256, outputChannels: Int = 2) {
@@ -65,6 +73,7 @@ final class Rig {
         output = BufferListBox(streams: [outputChannels], frames: frames)
         // 256 frames at 48 kHz, the size the engine negotiates.
         host.setMeterDecay(framesPerBlock: frames, sampleRate: 48_000)
+        _ = host.runtime(forBus: masterBusID)
     }
 
     /// `sources` are `(bufferIndex, channelInBuffer, channelsInBuffer)`.
@@ -97,13 +106,20 @@ final class Rig {
             )
         }
         host.publish(
-            nodes: laneNodes,
-            outputBufferIndex: outputBufferIndex,
-            outputChannelsInBuffer: 2,
+            laneNodes: laneNodes,
+            laneBusIDs: nodes.map { _ in masterBusID },
             laneEffectIDs: laneEffects,
-            masterEffectIDs: masterEffects
+            buses: [RTEngineHost.BusPublishInfo(
+                id: masterBusID,
+                outputBufferIndex: outputBufferIndex,
+                outputChannelsInBuffer: 2,
+                effectIDs: masterEffects
+            )]
         )
     }
+
+    var masterMeter: MeterReading { host.busMeter(masterBusID) }
+    func setMasterGain(linear: Float) { host.setBusGain(masterBusID, linear: linear) }
 
     /// Renders one block and returns the master left/right it produced.
     @discardableResult
@@ -283,7 +299,7 @@ struct RenderKernelTests {
         // A sine's RMS sits 3.01 dB under its peak.
         #expect(abs(MeterReading.decibels(lanes.rms) + 23.01) < 0.1)
 
-        let master = rig.host.masterMeter
+        let master = rig.masterMeter
         #expect(abs(MeterReading.decibels(master.peak) + 20) < 0.1)
         #expect(abs(MeterReading.decibels(master.rms) + 23.01) < 0.1)
     }
@@ -295,7 +311,7 @@ struct RenderKernelTests {
         _ = rig.renderBlock()
         #expect(rig.host.laneMeter(lane).peak == 0)
         #expect(rig.host.laneMeter(lane).peakDB == -.infinity)
-        #expect(rig.host.masterMeter.peak == 0)
+        #expect(rig.masterMeter.peak == 0)
     }
 
     @Test func peakMeterDecaysInsteadOfDroppingToZero() {
@@ -375,7 +391,7 @@ struct RenderKernelTests {
         let rig = Rig(inputStreams: [1])
         let lane = rig.addLane(sources: [(0, 0, 1)])
         rig.publish([(lane, [(0, 0, 1)])])
-        rig.host.setMasterGain(linear: 0.25)
+        rig.setMasterGain(linear: 0.25)
         rig.input.fill(stream: 0, channel: 0) { _ in 1 }
         let rendered = rig.renderBlock()
         #expect(rendered.left.allSatisfy { abs($0 - 0.25) < 1e-6 })

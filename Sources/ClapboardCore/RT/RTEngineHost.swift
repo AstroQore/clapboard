@@ -4,10 +4,10 @@ import Synchronization
 
 /// Main-thread owner of everything the render thread reads.
 ///
-/// It allocates `RTState`, one `LaneRuntime` per lane id, and the immutable
-/// graph snapshots; it publishes a snapshot with a single atomic store and
-/// reclaims retired ones only once the render thread has demonstrably moved
-/// past them.
+/// It allocates `RTState`, one `LaneRuntime` per lane id, one `BusRuntime` per
+/// bus id, and the immutable graph snapshots; it publishes a snapshot with a
+/// single atomic store and reclaims retired ones only once the render thread
+/// has demonstrably moved past them.
 ///
 /// Nothing here is called from the render thread.
 public final class RTEngineHost {
@@ -15,10 +15,14 @@ public final class RTEngineHost {
         let graph: UnsafeMutablePointer<RTGraph>
         let lanes: UnsafeMutablePointer<RTLaneNode>?
         let laneCount: Int
+        let buses: UnsafeMutablePointer<RTBusNode>?
+        let busCount: Int
         let generation: UInt64
         /// Lane runtimes whose lanes were removed in the publish that retired
         /// this snapshot. They can only be freed with it.
         let laneRuntimes: [UnsafeMutablePointer<LaneRuntime>]
+        /// Same rule for buses removed in the same publish.
+        let busRuntimes: [UnsafeMutablePointer<BusRuntime>]
         /// Effects removed in the same publish. Same rule, one level up: the
         /// plug-in stays alive until the render thread has provably left every
         /// snapshot that could reach its slot.
@@ -34,15 +38,50 @@ public final class RTEngineHost {
         let channels: Int
     }
 
+    /// One bus as `publish` wants it described: identity, chain, parent, and
+    /// where its output goes. `RTEngineHost` resolves `parentID` to an index
+    /// inside `buses` and patches `effectIDs` into the flat slot storage —
+    /// callers never see an `RTBusNode` directly.
+    public struct BusPublishInfo {
+        public let id: UUID
+        /// `nil` for a root bus.
+        public let parentID: UUID?
+        /// `-1` when this bus has no output device.
+        public let outputBufferIndex: Int
+        public let outputChannelOffset: Int
+        public let outputChannelsInBuffer: Int
+        public let effectIDs: [UUID]
+
+        public init(
+            id: UUID,
+            parentID: UUID? = nil,
+            outputBufferIndex: Int = -1,
+            outputChannelOffset: Int = 0,
+            outputChannelsInBuffer: Int = 0,
+            effectIDs: [UUID] = []
+        ) {
+            self.id = id
+            self.parentID = parentID
+            self.outputBufferIndex = outputBufferIndex
+            self.outputChannelOffset = outputChannelOffset
+            self.outputChannelsInBuffer = outputChannelsInBuffer
+            self.effectIDs = effectIDs
+        }
+    }
+
     /// The single value an IOProc block may capture.
     public let state: UnsafeMutablePointer<RTState>
 
     private var laneRuntimes: [UUID: UnsafeMutablePointer<LaneRuntime>] = [:]
+    private var busRuntimes: [UUID: UnsafeMutablePointer<BusRuntime>] = [:]
     private var liveGraph: UnsafeMutablePointer<RTGraph>?
     private var liveLanes: UnsafeMutablePointer<RTLaneNode>?
     private var liveLaneCount = 0
+    private var liveBuses: UnsafeMutablePointer<RTBusNode>?
+    private var liveBusCount = 0
     private var retired: [Retired] = []
     private var pendingRuntimeFrees: [UnsafeMutablePointer<LaneRuntime>] = []
+    private var pendingBusRuntimeFrees: [UnsafeMutablePointer<BusRuntime>] = []
     private var nextGeneration: UInt64 = 1
     /// Lanes that currently own an Auto Sync capture buffer.
     private var captureLaneIDs: [UUID] = []
@@ -62,16 +101,25 @@ public final class RTEngineHost {
         // block is not running when it returns.
         state.pointee.graph.store(nil, ordering: .releasing)
         for entry in retired {
-            RTMemory.destroyGraph(entry.graph, lanes: entry.lanes, laneCount: entry.laneCount)
+            RTMemory.destroyGraph(
+                entry.graph, lanes: entry.lanes, laneCount: entry.laneCount,
+                buses: entry.buses, busCount: entry.busCount
+            )
             for runtime in entry.laneRuntimes { RTMemory.destroyLaneRuntime(runtime) }
+            for runtime in entry.busRuntimes { RTMemory.destroyBusRuntime(runtime) }
             for effect in entry.effects { RTMemory.destroyEffectRuntime(effect.runtime) }
         }
         retired.removeAll()
         if let liveGraph {
-            RTMemory.destroyGraph(liveGraph, lanes: liveLanes, laneCount: liveLaneCount)
+            RTMemory.destroyGraph(
+                liveGraph, lanes: liveLanes, laneCount: liveLaneCount,
+                buses: liveBuses, busCount: liveBusCount
+            )
         }
         for runtime in pendingRuntimeFrees { RTMemory.destroyLaneRuntime(runtime) }
         for runtime in laneRuntimes.values { RTMemory.destroyLaneRuntime(runtime) }
+        for runtime in pendingBusRuntimeFrees { RTMemory.destroyBusRuntime(runtime) }
+        for runtime in busRuntimes.values { RTMemory.destroyBusRuntime(runtime) }
         for effect in pendingEffectFrees { RTMemory.destroyEffectRuntime(effect.runtime) }
         for effect in effects.values { RTMemory.destroyEffectRuntime(effect.runtime) }
         effects.removeAll()
@@ -155,6 +203,29 @@ public final class RTEngineHost {
         laneRuntimes[laneID] != nil
     }
 
+    // MARK: - Bus runtimes
+
+    /// Same contract as `runtime(for:)`, one level up: creates a bus's
+    /// persistent accumulator/delay/meter state on first use, kept across
+    /// graph rebuilds so re-routing an unrelated lane never resets a bus's
+    /// fader ramp or PDC delay line.
+    @discardableResult
+    public func runtime(forBus busID: UUID) -> UnsafeMutablePointer<BusRuntime> {
+        if let existing = busRuntimes[busID] { return existing }
+        let created = RTMemory.makeBusRuntime()
+        busRuntimes[busID] = created
+        return created
+    }
+
+    public func discardBusRuntime(for busID: UUID) {
+        guard let runtime = busRuntimes.removeValue(forKey: busID) else { return }
+        pendingBusRuntimeFrees.append(runtime)
+    }
+
+    public func hasBusRuntime(for busID: UUID) -> Bool {
+        busRuntimes[busID] != nil
+    }
+
     // MARK: - Parameters
 
     public func setLaneGain(_ laneID: UUID, linear: Float) {
@@ -174,8 +245,20 @@ public final class RTEngineHost {
         laneRuntimes[laneID]?.pointee.parameters.delaySamples.store(clamped, ordering: .relaxed)
     }
 
-    public func setMasterGain(linear: Float) {
-        state.pointee.masterGainLinear.store(linear, ordering: .relaxed)
+    public func setBusGain(_ busID: UUID, linear: Float) {
+        busRuntimes[busID]?.pointee.parameters.gainLinear.store(linear, ordering: .relaxed)
+    }
+
+    /// Effective enable, i.e. `!muted && (no solo in scope || solo)` —
+    /// `SoloLogic` computes it, this just publishes the bit.
+    public func setBusEnabled(_ busID: UUID, _ enabled: Bool) {
+        busRuntimes[busID]?.pointee.parameters.enabled.store(enabled, ordering: .relaxed)
+    }
+
+    /// The PDC compensation delay `LatencyPlan` computed for this bus.
+    public func setBusDelay(_ busID: UUID, samples: Int) {
+        let clamped = max(0, min(RTLimits.maxDelaySamples, samples))
+        busRuntimes[busID]?.pointee.parameters.delaySamples.store(clamped, ordering: .relaxed)
     }
 
     /// Peak-hold decay per block, derived from the negotiated block size so
@@ -195,15 +278,19 @@ public final class RTEngineHost {
         )
     }
 
-    public var masterMeter: MeterReading {
-        let left = state.pointee.masterPeakLeft.load(ordering: .relaxed)
-        let right = state.pointee.masterPeakRight.load(ordering: .relaxed)
-        return MeterReading(peak: max(left, right), rms: state.pointee.masterRMS.load(ordering: .relaxed))
+    public func busMeter(_ busID: UUID) -> MeterReading {
+        guard let runtime = busRuntimes[busID] else { return .silent }
+        let left = runtime.pointee.parameters.meterPeakLeft.load(ordering: .relaxed)
+        let right = runtime.pointee.parameters.meterPeakRight.load(ordering: .relaxed)
+        return MeterReading(peak: max(left, right), rms: runtime.pointee.parameters.meterRMS.load(ordering: .relaxed))
     }
 
-    public var masterPeaks: (left: Float, right: Float) {
-        (state.pointee.masterPeakLeft.load(ordering: .relaxed),
-         state.pointee.masterPeakRight.load(ordering: .relaxed))
+    public func busPeaks(_ busID: UUID) -> (left: Float, right: Float) {
+        guard let runtime = busRuntimes[busID] else { return (0, 0) }
+        return (
+            runtime.pointee.parameters.meterPeakLeft.load(ordering: .relaxed),
+            runtime.pointee.parameters.meterPeakRight.load(ordering: .relaxed)
+        )
     }
 
     public var overloadCount: Int {
@@ -335,27 +422,36 @@ public final class RTEngineHost {
     /// Publishes a new topology. The previous snapshot is retired, not freed.
     ///
     /// - Parameters:
-    ///   - laneEffectIDs: each lane's chain, in order, parallel to `nodes`.
+    ///   - laneNodes: one node per lane, in lane order. `busIndex` is
+    ///     overwritten from `laneBusIDs`; callers do not need to resolve it.
+    ///   - laneBusIDs: each lane's destination bus id, parallel to `laneNodes`.
+    ///     `nil` (or an id not present in `buses`) publishes a lane that runs
+    ///     its delay line and meter but reaches no bus.
+    ///   - laneEffectIDs: each lane's chain, in order, parallel to `laneNodes`.
     ///     Ids the host does not know are skipped rather than refused, so a
     ///     chain edit racing a republish cannot publish a dangling slot.
-    ///   - masterEffectIDs: the master bus chain.
+    ///   - buses: every bus, in topological order (children before parents —
+    ///     `RoutingGraph.order`). A bus this host has no runtime for (it must
+    ///     already have been created via `runtime(forBus:)`) is dropped.
     public func publish(
-        nodes: [RTLaneNode],
-        outputBufferIndex: Int,
-        outputChannelsInBuffer: Int,
-        outputChannelOffset: Int = 0,
+        laneNodes: [RTLaneNode],
+        laneBusIDs: [UUID?] = [],
         laneEffectIDs: [[UUID]] = [],
-        masterEffectIDs: [UUID] = []
+        buses: [BusPublishInfo] = []
     ) {
         let generation = nextGeneration
         nextGeneration += 1
 
+        var busIndexByID: [UUID: Int] = [:]
+        for (index, bus) in buses.enumerated() { busIndexByID[bus.id] = index }
+
         // One flat allocation for every slot in the snapshot: each lane's
-        // chain in lane order, then the master chain. The ranges are recorded
-        // first because the pointers only exist once the buffer does.
+        // chain in lane order, then each bus's chain in bus order. The ranges
+        // are recorded first because the pointers only exist once the buffer
+        // does.
         var slots: [RTEffectSlot] = []
-        var laneRanges = [(offset: Int, count: Int)](repeating: (0, 0), count: nodes.count)
-        for index in nodes.indices {
+        var laneRanges = [(offset: Int, count: Int)](repeating: (0, 0), count: laneNodes.count)
+        for index in laneNodes.indices {
             let ids = index < laneEffectIDs.count ? laneEffectIDs[index] : []
             let offset = slots.count
             for id in ids.prefix(RTLimits.maxEffectsPerChain) {
@@ -364,64 +460,97 @@ public final class RTEngineHost {
             }
             laneRanges[index] = (offset, slots.count - offset)
         }
-        let masterOffset = slots.count
-        for id in masterEffectIDs.prefix(RTLimits.maxEffectsPerChain) {
-            guard let entry = effects[id] else { continue }
-            slots.append(makeSlot(entry))
+        var busRanges = [(offset: Int, count: Int)](repeating: (0, 0), count: buses.count)
+        for (index, bus) in buses.enumerated() {
+            let offset = slots.count
+            for id in bus.effectIDs.prefix(RTLimits.maxEffectsPerChain) {
+                guard let entry = effects[id] else { continue }
+                slots.append(makeSlot(entry))
+            }
+            busRanges[index] = (offset, slots.count - offset)
         }
-        let masterCount = slots.count - masterOffset
         let storage = RTMemory.makeEffectSlots(slots)
 
-        var patched = nodes
-        for index in patched.indices {
+        var patchedLanes = laneNodes
+        for index in patchedLanes.indices {
             let range = laneRanges[index]
             if range.count > 0, let storage {
-                patched[index].effects = storage.advanced(by: range.offset)
-                patched[index].effectCount = range.count
+                patchedLanes[index].effects = storage.advanced(by: range.offset)
+                patchedLanes[index].effectCount = range.count
             } else {
-                patched[index].effects = nil
-                patched[index].effectCount = 0
+                patchedLanes[index].effects = nil
+                patchedLanes[index].effectCount = 0
             }
+            let busID = index < laneBusIDs.count ? laneBusIDs[index] : nil
+            patchedLanes[index].busIndex = busID.flatMap { busIndexByID[$0] } ?? -1
+        }
+
+        var busNodes: [RTBusNode] = []
+        busNodes.reserveCapacity(buses.count)
+        for (index, bus) in buses.enumerated() {
+            // Every published bus must already have a runtime — `AudioEngine`
+            // calls `runtime(forBus:)` the moment a `BusConfig` is added, the
+            // same convention lanes use. A bus missing one here would be a
+            // caller bug, not something to silently drop, but skipping it
+            // rather than crashing the render thread is the safer failure.
+            guard let runtime = busRuntimes[bus.id] else { continue }
+            let range = busRanges[index]
+            let effectsPointer = (range.count > 0 ? storage?.advanced(by: range.offset) : nil)
+            busNodes.append(RTBusNode(
+                runtime: runtime,
+                effects: effectsPointer,
+                effectCount: range.count,
+                parentBusIndex: bus.parentID.flatMap { busIndexByID[$0] } ?? -1,
+                outputBufferIndex: bus.outputBufferIndex,
+                outputChannelOffset: bus.outputChannelOffset,
+                outputChannelsInBuffer: bus.outputChannelsInBuffer
+            ))
         }
 
         let made = RTMemory.makeGraph(
             generation: generation,
-            nodes: patched,
-            outputBufferIndex: outputBufferIndex,
-            outputChannelsInBuffer: outputChannelsInBuffer,
-            outputChannelOffset: outputChannelOffset,
+            laneNodes: patchedLanes,
+            busNodes: busNodes,
             effectSlots: storage,
-            effectSlotCount: slots.count,
-            masterEffectOffset: masterOffset,
-            masterEffectCount: masterCount
+            effectSlotCount: slots.count
         )
         let previousGraph = liveGraph
         let previousLanes = liveLanes
-        let previousCount = liveLaneCount
+        let previousLaneCount = liveLaneCount
+        let previousBuses = liveBuses
+        let previousBusCount = liveBusCount
         let previousGeneration = previousGraph?.pointee.generation ?? 0
 
         liveGraph = made.graph
         liveLanes = made.lanes
-        liveLaneCount = nodes.count
+        liveLaneCount = laneNodes.count
+        liveBuses = made.buses
+        liveBusCount = busNodes.count
         state.pointee.graph.store(UnsafeMutableRawPointer(made.graph), ordering: .releasing)
 
-        let freeing = pendingRuntimeFrees
+        let freeingLanes = pendingRuntimeFrees
         pendingRuntimeFrees.removeAll(keepingCapacity: true)
+        let freeingBuses = pendingBusRuntimeFrees
+        pendingBusRuntimeFrees.removeAll(keepingCapacity: true)
         let freeingEffects = pendingEffectFrees
         pendingEffectFrees.removeAll(keepingCapacity: true)
         if let previousGraph {
             retired.append(Retired(
                 graph: previousGraph,
                 lanes: previousLanes,
-                laneCount: previousCount,
+                laneCount: previousLaneCount,
+                buses: previousBuses,
+                busCount: previousBusCount,
                 generation: previousGeneration,
-                laneRuntimes: freeing,
+                laneRuntimes: freeingLanes,
+                busRuntimes: freeingBuses,
                 effects: freeingEffects
             ))
         } else {
             // Nothing was published before, so nothing can be referencing the
             // discarded runtimes.
-            for runtime in freeing { RTMemory.destroyLaneRuntime(runtime) }
+            for runtime in freeingLanes { RTMemory.destroyLaneRuntime(runtime) }
+            for runtime in freeingBuses { RTMemory.destroyBusRuntime(runtime) }
             reclaim(freeingEffects)
         }
         collectGarbage()
@@ -451,21 +580,29 @@ public final class RTEngineHost {
                 graph: liveGraph,
                 lanes: liveLanes,
                 laneCount: liveLaneCount,
+                buses: liveBuses,
+                busCount: liveBusCount,
                 generation: liveGraph.pointee.generation,
                 laneRuntimes: pendingRuntimeFrees,
+                busRuntimes: pendingBusRuntimeFrees,
                 effects: pendingEffectFrees
             ))
             pendingRuntimeFrees.removeAll(keepingCapacity: true)
+            pendingBusRuntimeFrees.removeAll(keepingCapacity: true)
             pendingEffectFrees.removeAll(keepingCapacity: true)
         } else {
             for runtime in pendingRuntimeFrees { RTMemory.destroyLaneRuntime(runtime) }
             pendingRuntimeFrees.removeAll(keepingCapacity: true)
+            for runtime in pendingBusRuntimeFrees { RTMemory.destroyBusRuntime(runtime) }
+            pendingBusRuntimeFrees.removeAll(keepingCapacity: true)
             reclaim(pendingEffectFrees)
             pendingEffectFrees.removeAll(keepingCapacity: true)
         }
         liveGraph = nil
         liveLanes = nil
         liveLaneCount = 0
+        liveBuses = nil
+        liveBusCount = 0
         collectGarbage(renderThreadIdle: true)
     }
 
@@ -485,8 +622,12 @@ public final class RTEngineHost {
         var kept: [Retired] = []
         for entry in retired {
             if renderThreadIdle || exitGeneration > entry.generation {
-                RTMemory.destroyGraph(entry.graph, lanes: entry.lanes, laneCount: entry.laneCount)
+                RTMemory.destroyGraph(
+                    entry.graph, lanes: entry.lanes, laneCount: entry.laneCount,
+                    buses: entry.buses, busCount: entry.busCount
+                )
                 for runtime in entry.laneRuntimes { RTMemory.destroyLaneRuntime(runtime) }
+                for runtime in entry.busRuntimes { RTMemory.destroyBusRuntime(runtime) }
                 // The plug-ins go on the reclaim list rather than being torn
                 // down here: `teardown()` is main-actor work.
                 reclaim(entry.effects)

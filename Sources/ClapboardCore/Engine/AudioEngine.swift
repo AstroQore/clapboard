@@ -72,7 +72,7 @@ public final class AudioEngine {
     /// True while a restored session's chains are still being instantiated.
     public internal(set) var restoringEffects = false
     public var masterGainDB: Float = 0 {
-        didSet { host.setMasterGain(linear: Decibels.linear(masterGainDB)) }
+        didSet { host.setBusGain(masterBusID, linear: Decibels.linear(masterGainDB)) }
     }
     public private(set) var microphoneAuthorized = false
 
@@ -96,6 +96,11 @@ public final class AudioEngine {
     // MARK: - Private
 
     let host = RTEngineHost()
+    /// Every mixer has at least one bus; this is that one, created before any
+    /// session or UI touches the engine. Placeholder for the full `BusConfig`
+    /// model landing next — kept private so nothing outside this file depends
+    /// on there being exactly one.
+    let masterBusID = UUID()
     /// Restoring a session's chains means instantiating plug-ins, which is
     /// `async`; the task is kept so a second restore cannot race the first.
     var effectRestoreTask: Task<Void, Never>?
@@ -113,6 +118,7 @@ public final class AudioEngine {
 
     public init() {
         host.setMeterDecay(framesPerBlock: 256, sampleRate: 48_000)
+        _ = host.runtime(forBus: masterBusID)
         refreshAuthorization()
         TerminationGuard.register(self)
     }
@@ -339,8 +345,8 @@ public final class AudioEngine {
     // MARK: - Meters
 
     public func meter(laneID: UUID) -> MeterReading { host.laneMeter(laneID) }
-    public var masterMeter: MeterReading { host.masterMeter }
-    public var masterPeaks: (left: Float, right: Float) { host.masterPeaks }
+    public var masterMeter: MeterReading { host.busMeter(masterBusID) }
+    public var masterPeaks: (left: Float, right: Float) { host.busPeaks(masterBusID) }
     public var callbackCount: Int { host.callbackCount }
     public var droppedBlocks: Int { host.droppedBlocks }
 
@@ -516,7 +522,7 @@ public final class AudioEngine {
             host.runtime(for: lane.id)
             pushParameters(lane)
         }
-        host.setMasterGain(linear: Decibels.linear(masterGainDB))
+        host.setBusGain(masterBusID, linear: Decibels.linear(masterGainDB))
         // Chains survive a stop/start and every aggregate rebuild — reloading
         // a plug-in would drop its state and its editor window — but their
         // tails do not: a 20-second delay must not keep ringing across the
@@ -686,12 +692,17 @@ public final class AudioEngine {
         }
         laneStatus = status
         host.publish(
-            nodes: nodes,
-            outputBufferIndex: aggregate.masterOutputBufferIndex,
-            outputChannelsInBuffer: aggregate.masterOutputChannels,
-            outputChannelOffset: 0,
+            laneNodes: nodes,
+            laneBusIDs: lanes.map { _ in masterBusID },
             laneEffectIDs: lanes.map { publishableEffectIDs(laneEffects[$0.id]) },
-            masterEffectIDs: publishableEffectIDs(masterEffects)
+            buses: [RTEngineHost.BusPublishInfo(
+                id: masterBusID,
+                parentID: nil,
+                outputBufferIndex: aggregate.masterOutputBufferIndex,
+                outputChannelOffset: 0,
+                outputChannelsInBuffer: aggregate.masterOutputChannels,
+                effectIDs: publishableEffectIDs(masterEffects)
+            )]
         )
     }
 
