@@ -104,6 +104,10 @@ codesign -dv "$BUNDLE" 2>&1 | sed 's/^/    /'
 if [[ "$RUN_HARNESS" -eq 1 ]]; then
     HARNESS_BIN="$BUILD_DIR/clapboard-driver-harness"
     HARNESS_TARGET="$BUNDLE/Contents/MacOS/ClapboardDriver"
+    # Empty-array expansion is an "unbound variable" error under `set -u` in
+    # bash 3.2, which is still what macOS ships as /bin/bash and what the CI
+    # runner uses. `${name[@]+"${name[@]}"}` expands to nothing when the array
+    # is empty and to its elements otherwise, on every bash.
     HARNESS_SAN=()
 
     if [[ "$RUN_HARNESS_ASAN" -eq 1 ]]; then
@@ -120,7 +124,7 @@ if [[ "$RUN_HARNESS" -eq 1 ]]; then
             -fPIC \
             -arch "$(uname -m)" \
             -mmacosx-version-min=12.0 \
-            "${HARNESS_SAN[@]}" \
+            ${HARNESS_SAN[@]+"${HARNESS_SAN[@]}"} \
             "${FRAMEWORKS[@]}" \
             "${SOURCES[@]}" \
             -o "$HARNESS_TARGET"
@@ -134,7 +138,7 @@ if [[ "$RUN_HARNESS" -eq 1 ]]; then
         "${OPT[@]}" \
         -arch "$(uname -m)" \
         -mmacosx-version-min=12.0 \
-        "${HARNESS_SAN[@]}" \
+        ${HARNESS_SAN[@]+"${HARNESS_SAN[@]}"} \
         "${FRAMEWORKS[@]}" \
         "$ROOT/Driver/Harness/harness.c" \
         -o "$HARNESS_BIN"
