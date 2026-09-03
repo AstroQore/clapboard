@@ -1,0 +1,79 @@
+name: Build GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Test, package, and draft release
+    runs-on: macos-26
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify toolchain
+        run: |
+          sw_vers -productVersion
+          xcode-select -p
+          swift --version
+
+      - name: swift test
+        timeout-minutes: 10
+        run: swift test
+
+      - name: Build and ad-hoc sign the release app
+        run: ./Scripts/build_app.sh release
+
+      - name: Verify empty entitlements
+        run: codesign -d --entitlements - .build/Clapboard.app
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_DIR=".build/release"
+          mkdir -p "$OUT_DIR"
+          VERSION="${RELEASE_TAG#v}"
+          ZIP_NAME="Clapboard-${VERSION}-macOS.zip"
+
+          # ditto preserves the .app bundle structure (permissions, resource
+          # fork-free layout) correctly; a plain `zip -r` does not.
+          ditto -c -k --keepParent .build/Clapboard.app "$OUT_DIR/$ZIP_NAME"
+          ( cd "$OUT_DIR" && shasum -a 256 "$ZIP_NAME" > "$ZIP_NAME.sha256" )
+
+          echo "RELEASE_ZIP=$OUT_DIR/$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "RELEASE_SHA=$OUT_DIR/$ZIP_NAME.sha256" >> "$GITHUB_ENV"
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            "$RELEASE_ZIP" "$RELEASE_SHA" \
+            --title "Clapboard ${RELEASE_TAG#v}" \
+            --draft \
+            --generate-notes \
+            --verify-tag \
+            || gh release upload "$RELEASE_TAG" "$RELEASE_ZIP" "$RELEASE_SHA" --clobber

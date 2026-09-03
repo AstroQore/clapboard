@@ -157,6 +157,24 @@ Sources/ClapboardApp          app entry, controllers, views
 Scripts/build_app.sh          bundle + sign .build/Clapboard.app
 ```
 
+## Status, contributing, and license
+
+See the Status table above for what's implemented; `docs/ARCHITECTURE.md`
+marks planned-but-not-implemented items (bus routing, hotkeys, a
+virtual-device driver, process taps) explicitly so this README doesn't have
+to be re-checked against the code to know what's real.
+
+**The virtual-device driver is planned, not implemented.** When it lands, it
+installs a HAL plug-in system-wide under `/Library/Audio/Plug-Ins/HAL` and
+requires administrator rights — see `docs/PERMISSIONS.md`.
+
+Contributions are welcome — see `CONTRIBUTING.md` for the build/test/package
+verification steps, the real-time audio rules, and the PR checklist. Please
+also read `CODE_OF_CONDUCT.md` and, for anything security-sensitive,
+`SECURITY.md`.
+
 ## License
 
-TBD.
+AGPL-3.0-only. See `LICENSE` for the full text and `THIRD_PARTY_NOTICES.md`
+for what this project depends on (currently: nothing beyond Apple's system
+frameworks).
