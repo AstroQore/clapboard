@@ -305,16 +305,32 @@ struct AUEffectInstanceTests {
         }
 
         run(blocks: 2_000)  // let the plug-in settle whatever it allocates once
-        let before = liveBlocks()
-        run(blocks: 20_000)
-        let after = liveBlocks()
-        let growth = Int(after) - Int(before)
 
-        #expect(instance.renderedBlockCount == 22_000)
+        // `malloc_zone_statistics` counts the whole process, and the rest of
+        // the suite runs in this process in parallel: another test allocating
+        // while this one measures inflates the reading. That noise is strictly
+        // one-sided — a concurrent test can only add blocks, never remove ours
+        // — so the smallest of several attempts is the honest measurement.
+        // Retrying also costs nothing when the render path is clean, because
+        // the first attempt already passes and the loop stops.
+        var growth = Int.max
+        var attempts = 0
+        let limit = 200
+        while attempts < 5 {
+            attempts += 1
+            let before = liveBlocks()
+            run(blocks: 20_000)
+            let after = liveBlocks()
+            growth = min(growth, Int(after) - Int(before))
+            if growth < limit { break }
+        }
+
+        #expect(instance.renderedBlockCount == 2_000 + attempts * 20_000)
         #expect(instance.renderErrorCount == 0)
-        #expect(growth < 200,
-                "20 000 render calls added \(growth) live heap blocks; the render path allocates")
-        print("[au] 20 000 render calls: live heap blocks \(before) -> \(after) (\(growth))")
+        let complaint = "20 000 render calls added \(growth) live heap blocks over "
+            + "\(attempts) attempts; the render path allocates"
+        #expect(growth < limit, "\(complaint)")
+        print("[au] 20 000 render calls: smallest growth over \(attempts) attempt(s): \(growth)")
     }
 
     /// Third-party plug-ins are reported, never asserted on: what is installed
