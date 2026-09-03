@@ -23,6 +23,13 @@ public struct SessionDocument: Codable, Sendable, Equatable {
     /// lane's `destinationBus`. A version 1 reader still opens a version 2
     /// file — it just ignores `buses` and every lane's `destinationBus` and
     /// sees one flat mix, which is a worse mix, not a wrong one.
+    ///
+    /// Process taps did **not** bump this. A lane's new `source` key is
+    /// additive: a version 2 file written before taps existed has no `source`
+    /// and loads as a device lane, and a tap lane still writes the old
+    /// `deviceUID`/`deviceChannels` pair (as `tap:<bundle id>`), so an older
+    /// build reports the lane as a missing device instead of dropping it.
+    /// Exactly the case the tolerant decoding exists for.
     public static let currentFormatVersion = 2
 
     public var formatVersion: Int

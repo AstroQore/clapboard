@@ -113,7 +113,9 @@ extension AudioEngine {
             // A lane on any output device would feed the mix back into
             // itself; `setBusOutput` drops such a lane going forward, and a
             // hand-edited file must not be able to sneak one past it either.
-            guard !outputUIDs.contains(lane.deviceUID) else {
+            // A tap lane cannot collide — its key is never a device UID, and
+            // a system-wide tap excludes Clapboard's own output already.
+            guard lane.source.isProcessTap || !outputUIDs.contains(lane.deviceUID) else {
                 report.skippedLanes.append("\(lane.name): its device is an output device")
                 continue
             }
@@ -312,10 +314,19 @@ extension AudioEngine {
     /// Values from a file are not values from the UI: clamp them to what the
     /// render thread can actually accept before they reach it.
     private static func sanitized(_ lane: LaneConfig, id: UUID) -> LaneConfig {
-        LaneConfig(
+        // A tap source passes through untouched: its "channels" are decided by
+        // `TapSpec.mono`, not by anything in the file that could be out of
+        // range, and the bundle id is resolved when the tap is built.
+        let source: LaneSource
+        switch lane.source {
+        case .processTap:
+            source = lane.source
+        case .device(let uid, let channels):
+            source = .device(uid: uid, channels: LaneConfig.sanitized(channels: channels))
+        }
+        return LaneConfig(
             id: id,
-            deviceUID: lane.deviceUID,
-            deviceChannels: LaneConfig.sanitized(channels: lane.deviceChannels),
+            source: source,
             name: lane.name,
             gainDB: clampedGainDB(lane.gainDB),
             enabled: lane.enabled,
