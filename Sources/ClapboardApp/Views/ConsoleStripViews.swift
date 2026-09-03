@@ -306,8 +306,12 @@ private struct LaneStripControls: View {
     let lane: LaneConfig
     let status: AudioEngine.LaneStatus
 
+    /// What the source menu is labelled with: a device's name, or the tap's
+    /// own display name — never the `tap:<bundle id>` key, which is a lookup
+    /// key rather than something to read.
     private var deviceName: String {
-        registry.device(uid: lane.deviceUID)?.name ?? lane.deviceUID
+        if let tap = lane.source.tap { return tap.name }
+        return registry.device(uid: lane.deviceUID)?.name ?? lane.deviceUID
     }
 
     /// The same exclusions `AddLaneSheet` applies: Bluetooth is unstable and
@@ -320,18 +324,31 @@ private struct LaneStripControls: View {
         }
     }
 
+    /// Only processes with a bundle id, for the same reason `AddLaneSheet`
+    /// filters them: a tap is rebuilt from its bundle id on every engine
+    /// start, so a bare command-line process could never come back.
+    private var tapCandidates: [TappableProcess] {
+        engine.tappableProcesses.filter { $0.bundleID != nil }
+    }
+
     var body: some View {
         StripNameField(name: lane.name, prompt: "Lane") { engine.setLaneName(lane.id, $0) }
 
         sourceMenu
 
         if status.isProblem {
+            // A tap that would not build carries its own sentence — the app
+            // is not playing, or macOS refuses the capture — and that is the
+            // whole point of showing it here rather than letting the lane sit
+            // at the noise floor looking like a wiring mistake.
+            let reason = engine.laneStatusReason[lane.id]
             StripCaption(
-                text: status == .deviceMissing ? "device missing" : "channel range",
+                text: reason ?? (status == .deviceMissing ? "device missing" : "channel range"),
                 systemImage: "exclamationmark.triangle.fill",
                 tint: .primary
             )
             .foregroundStyle(.orange)
+            .help(reason ?? "")
         } else {
             StripCaption(text: lane.channelLabel, systemImage: "waveform", tint: .tertiary)
         }
@@ -368,6 +385,8 @@ private struct LaneStripControls: View {
                     }
                 }
             }
+            Divider()
+            applicationSourceMenu
         } label: {
             Text(deviceName)
                 .font(.caption2)
@@ -377,7 +396,32 @@ private struct LaneStripControls: View {
         .menuStyle(.button)
         .buttonStyle(.borderless)
         .controlSize(.small)
-        .help("\(deviceName) · \(lane.channelLabel) — click to re-pick the source device and channels")
+        .help("\(deviceName) · \(lane.channelLabel) — click to re-pick the source")
+    }
+
+    /// Process taps, offered from the same menu as the input devices because
+    /// they are the same thing to a lane: pick what it listens to. The process
+    /// list is only refreshed when the menu is opened — enumerating the HAL's
+    /// clients on every frame of a 30 Hz console would be absurd.
+    private var applicationSourceMenu: some View {
+        Menu("Application audio") {
+            Button("System audio") { pickTap(.systemAudio, name: "System audio") }
+            if !tapCandidates.isEmpty { Divider() }
+            ForEach(tapCandidates) { process in
+                Button(process.name) {
+                    pickTap(.app(bundleID: process.bundleID ?? ""), name: process.name)
+                }
+            }
+            Divider()
+            Button("Refresh list") { engine.refreshTappableProcesses() }
+        }
+    }
+
+    /// Keeps whichever of mono/stereo the lane already had, so re-picking the
+    /// source does not silently change the lane's width.
+    private func pickTap(_ target: TapSpec.Target, name: String) {
+        engine.setLaneSource(lane.id, .processTap(TapSpec(
+            target: target, name: name, mono: !lane.isStereo)))
     }
 
     private var destinationPicker: some View {
