@@ -1,0 +1,17 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+.DS_Store
+Package.resolved
+*.app/
+dist/
+.codex/
+.claude/
+.grok/
+.agy/
+.gemini/
+.cursor/
+.agents/
+__pycache__/
+*.pyc
