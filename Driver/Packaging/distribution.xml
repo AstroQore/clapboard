@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- productbuild template. Scripts/build_driver_pkg.sh substitutes @VERSION@. -->
+<installer-gui-script minSpecVersion="2">
+    <title>Clapboard Virtual Audio Devices</title>
+    <organization>com.astroqore</organization>
+    <options customize="never" require-scripts="false" rootVolumeOnly="true"
+             hostArchitectures="arm64,x86_64"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="12.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.astroqore.ClapboardDriver"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.astroqore.ClapboardDriver" visible="false">
+        <pkg-ref id="com.astroqore.ClapboardDriver"/>
+    </choice>
+    <pkg-ref id="com.astroqore.ClapboardDriver" version="@VERSION@"
+             onConclusion="none">ClapboardDriver-component.pkg</pkg-ref>
+</installer-gui-script>

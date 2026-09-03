@@ -1,0 +1,27 @@
+#!/bin/bash
+# Runs as root from the ClapboardDriver installer package.
+#
+# pkgbuild has already written ClapboardDriver.driver into
+# /Library/Audio/Plug-Ins/HAL. All that is left is to make sure coreaudiod
+# will accept it (root:wheel, not group/other writable) and to restart
+# coreaudiod so the new plug-in is picked up without a reboot.
+set -u
+
+DRIVER="/Library/Audio/Plug-Ins/HAL/ClapboardDriver.driver"
+
+if [ ! -d "$DRIVER" ]; then
+    echo "postinstall: $DRIVER is missing" >&2
+    exit 1
+fi
+
+chown -R root:wheel "$DRIVER"
+chmod -R go-w "$DRIVER"
+
+# Restarting coreaudiod drops every audio client for a moment; that is the
+# only way to make it rescan /Library/Audio/Plug-Ins/HAL.
+if ! /bin/launchctl kickstart -kp system/com.apple.audio.coreaudiod; then
+    echo "postinstall: launchctl kickstart failed, falling back to killall" >&2
+    /usr/bin/killall coreaudiod || true
+fi
+
+exit 0

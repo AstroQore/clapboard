@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+body { font: 13px -apple-system, sans-serif; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 8px 0; }
+li { margin-bottom: 4px; }
+code { font: 12px ui-monospace, Menlo, monospace; }
+</style></head>
+<body>
+<h2>Clapboard Virtual Audio Devices</h2>
+<p>This installs <code>ClapboardDriver.driver</code> into
+<code>/Library/Audio/Plug-Ins/HAL</code> and adds four loopback audio devices
+to macOS: <b>Clapboard Bus 1</b> through <b>Clapboard Bus 4</b>.</p>
+<p>Each bus is a 2-channel, 48 kHz virtual device. Anything an app plays to a
+bus can be captured from the same bus by any other app — OBS, Zoom, Audio
+Hijack, QuickTime — with no cables and no extra software.</p>
+<ul>
+<li>The installer needs an administrator password: the plug-in folder is
+    owned by the system.</li>
+<li>Core Audio is restarted at the end of the install, so audio drops out for
+    a second and running audio apps may need to be restarted.</li>
+<li>Nothing else on the system is touched, and no background agent is added.</li>
+</ul>
+</body>
+</html>

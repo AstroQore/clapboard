@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>ClapboardDriver</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.astroqore.ClapboardDriver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ClapboardDriver</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 AstroQore. Licensed under AGPL-3.0-only.</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+
+	<!-- CFPlugIn wiring. The type UUID is Apple's kAudioServerPlugInTypeUUID;
+	     the factory UUID is this driver's own and must match the key in
+	     CFPlugInFactories. -->
+	<key>CFPlugInDynamicRegistration</key>
+	<string>NO</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>720F7B52-2506-4472-A2C1-FF96229C33AB</key>
+		<string>ClapboardDriver_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>720F7B52-2506-4472-A2C1-FF96229C33AB</string>
+		</array>
+	</dict>
+
+	<!-- How many "Clapboard Bus N" devices to publish. Clamped to 1…16.
+	     Editing this file needs sudo and a coreaudiod restart. -->
+	<key>ClapboardDeviceCount</key>
+	<integer>4</integer>
+</dict>
+</plist>
