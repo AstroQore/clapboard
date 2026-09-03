@@ -1,13 +1,38 @@
 import ClapboardCore
 import SwiftUI
 
+/// Amplitude → bar length, shared by the horizontal and vertical meters so the
+/// two never disagree about where −20 dB sits.
+enum MeterScale {
+    /// Bottom of every meter in the app.
+    static let floorDB: Float = -60
+
+    static func fraction(_ amplitude: Float, floorDB: Float = MeterScale.floorDB) -> CGFloat {
+        guard amplitude > 0 else { return 0 }
+        let db = MeterReading.decibels(amplitude)
+        guard db.isFinite else { return 0 }
+        let clamped = min(0, max(floorDB, db))
+        return CGFloat((clamped - floorDB) / -floorDB)
+    }
+
+    /// Green through orange to red: the last 3 dB and clipping are the two
+    /// things a glance has to catch.
+    static func peakColor(_ reading: MeterReading) -> Color {
+        reading.peak >= 0.99 ? .red : (reading.peakDB > -3 ? .orange : .primary)
+    }
+
+    static func label(_ reading: MeterReading) -> String {
+        reading.peak > 0 ? String(format: "%.1f dB peak", reading.peakDB) : "silent"
+    }
+}
+
 /// A horizontal peak/RMS bar on a dB scale.
 ///
 /// The decay is applied by the render thread, not here, so a 30 Hz poll can
 /// never miss a transient. This view only maps amplitude to a width.
 struct MeterBar: View {
     var reading: MeterReading
-    var floorDB: Float = -60
+    var floorDB: Float = MeterScale.floorDB
     var height: CGFloat = 10
 
     var body: some View {
@@ -18,34 +43,51 @@ struct MeterBar: View {
                     .fill(.quaternary)
                 Capsule()
                     .fill(.tint)
-                    .frame(width: width * fraction(reading.rms))
+                    .frame(width: width * MeterScale.fraction(reading.rms, floorDB: floorDB))
                 if reading.peak > 0 {
                     Capsule()
-                        .fill(peakColor)
+                        .fill(MeterScale.peakColor(reading))
                         .frame(width: 2)
-                        .offset(x: max(0, width * fraction(reading.peak) - 2))
+                        .offset(x: max(0, width * MeterScale.fraction(reading.peak, floorDB: floorDB) - 2))
                 }
             }
         }
         .frame(height: height)
         .accessibilityLabel("Level")
-        .accessibilityValue(label)
+        .accessibilityValue(MeterScale.label(reading))
     }
+}
 
-    private var peakColor: Color {
-        reading.peak >= 0.99 ? .red : (reading.peakDB > -3 ? .orange : .primary)
-    }
+/// The console strip's meter: the same scale as `MeterBar`, stood on end.
+///
+/// Deliberately timer-free. Every meter in the console is driven by the one
+/// `TimelineView` `ConsoleView` owns, which hands each strip a reading that has
+/// already been read out of the render thread's atomics.
+struct VerticalMeterBar: View {
+    var reading: MeterReading
+    var floorDB: Float = MeterScale.floorDB
+    var width: CGFloat = 10
 
-    private var label: String {
-        reading.peak > 0 ? String(format: "%.1f dB peak", reading.peakDB) : "silent"
-    }
-
-    private func fraction(_ amplitude: Float) -> CGFloat {
-        guard amplitude > 0 else { return 0 }
-        let db = MeterReading.decibels(amplitude)
-        guard db.isFinite else { return 0 }
-        let clamped = min(0, max(floorDB, db))
-        return CGFloat((clamped - floorDB) / -floorDB)
+    var body: some View {
+        GeometryReader { geometry in
+            let height = geometry.size.height
+            ZStack(alignment: .bottom) {
+                RoundedRectangle(cornerRadius: width / 2)
+                    .fill(.quaternary)
+                RoundedRectangle(cornerRadius: width / 2)
+                    .fill(.tint)
+                    .frame(height: height * MeterScale.fraction(reading.rms, floorDB: floorDB))
+                if reading.peak > 0 {
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(MeterScale.peakColor(reading))
+                        .frame(height: 2)
+                        .offset(y: -max(0, height * MeterScale.fraction(reading.peak, floorDB: floorDB) - 2))
+                }
+            }
+        }
+        .frame(width: width)
+        .accessibilityLabel("Level")
+        .accessibilityValue(MeterScale.label(reading))
     }
 }
 

@@ -1,7 +1,14 @@
 import ClapboardCore
 import SwiftUI
 
-/// The mixer: lanes on top, master at the bottom, transport in the toolbar.
+/// The row-based mixer: lanes on top, master at the bottom, transport in the
+/// toolbar.
+///
+/// Kept beside `ConsoleView` rather than replaced. It still runs against the
+/// Master bus only, through the shims `AudioEngine` keeps for it
+/// (`setOutputDevice`, `masterGainDB`, `masterEffects`, `masterMeter`), so it
+/// has no way to add a bus, route a lane elsewhere, or solo — for any of that,
+/// use the Console tab.
 struct MixerView: View {
     let engine: AudioEngine
     let registry: AudioDeviceRegistry
@@ -18,7 +25,7 @@ struct MixerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            statusBar
+            EngineStatusBar(engine: engine, permission: permission)
             Divider()
             laneList
             Divider()
@@ -31,99 +38,13 @@ struct MixerView: View {
             AutoSyncSheet(engine: engine, registry: registry)
         }
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    engine.runState.isRunning ? engine.stop() : engine.start()
-                } label: {
-                    Label(
-                        engine.runState.isRunning ? "Stop" : "Run",
-                        systemImage: engine.runState.isRunning ? "stop.fill" : "play.fill"
-                    )
-                }
-                .disabled(engine.runState.isBusy || engine.outputDeviceUID == nil)
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    showingAutoSync = true
-                } label: {
-                    Label("Auto Sync", systemImage: "hands.clap")
-                }
-                .disabled(!canAutoSync)
-                .help(canAutoSync
-                      ? "Clap once; Clapboard measures each lane's arrival and writes the compensating delay"
-                      : "Run the engine with at least two lanes first")
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    engine.rebuild(reason: "manual rebuild")
-                } label: {
-                    Label("Rebuild", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .disabled(!engine.runState.isRunning)
-                .help("Tear down and recreate the aggregate device and IOProc")
-            }
+            EngineToolbarButtons(engine: engine, showingAutoSync: $showingAutoSync)
         }
-    }
-
-    // MARK: - Status
-
-    private var statusBar: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
-            Text(engine.runState.label)
-                .font(.callout.weight(.medium))
-                .lineLimit(1)
-
-            if engine.runState.isRunning {
-                Label(
-                    engine.callbackHealthy ? "callbacks OK" : "no callbacks",
-                    systemImage: engine.callbackHealthy ? "waveform" : "waveform.slash"
-                )
-                .font(.caption)
-                .foregroundStyle(engine.callbackHealthy ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.red))
-
-                Text("overloads \(engine.overloadCount)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(engine.overloadCount > 0 ? .orange : .secondary)
-
-                Text("48 kHz · \(engine.bufferFrameSize) frames")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                if engine.restartCount > 0 {
-                    Text("rebuilds \(engine.restartCount)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            if permission.status != .authorized {
-                Label(permission.label, systemImage: "mic.slash")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(1)
-            }
-
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
     }
 
     /// Largest delay any lane is carrying, in ms — the span Auto Sync closed.
     private var spreadMilliseconds: Double {
         Double(engine.lanes.map(\.delaySamples).max() ?? 0) / engine.sampleRate * 1000
-    }
-
-    private var statusColor: Color {
-        switch engine.runState {
-        case .running: return engine.callbackHealthy ? .green : .orange
-        case .starting: return .yellow
-        case .failed: return .red
-        case .stopped: return .secondary
-        }
     }
 
     // MARK: - Lanes

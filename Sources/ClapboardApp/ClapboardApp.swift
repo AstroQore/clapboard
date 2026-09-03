@@ -14,7 +14,10 @@ struct ClapboardApp: App {
     var body: some Scene {
         WindowGroup("Clapboard") {
             MainView(engine: engine, registry: registry, permission: permission)
-                .frame(minWidth: 900, minHeight: 520)
+                // A console strip is a fixed 120 pt column of stacked controls
+                // with a fader under them; below about 600 pt of window the
+                // fader has nothing left to give.
+                .frame(minWidth: 940, minHeight: 600)
                 .onAppear {
                     registry.start()
                     permission.refresh()
@@ -45,7 +48,7 @@ struct ClapboardApp: App {
                     appDelegate.installStatusItem(engine: engine, hotkeys: hotkeys)
                 }
         }
-        .defaultSize(width: 1080, height: 660)
+        .defaultSize(width: 1100, height: 700)
         .commands {
             CommandGroup(after: .toolbar) {
                 Button("Mute All Microphones") { hotkeys.perform(.muteAllLanes) }

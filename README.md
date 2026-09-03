@@ -22,7 +22,8 @@ clap on every lane and writes the compensating delay into each one.
 | M4 Audio Unit hosting with latency compensation | done — every third-party AU on this Mac is Intel-only, so only Apple's have been exercised |
 | M5 Session persistence, missing-device handling | done |
 | M6 Virtual audio devices (Clapboard Bus 1…4, Core Audio HAL driver) | done — needs an install + coreaudiod restart to confirm on this Mac |
-| M7 Bus routing: model, RT graph, multi-output aggregate, session format 2 | done — headless only, no console UI yet |
+| M7 Bus routing: model, RT graph, multi-output aggregate, session format 2 | done |
+| M8 Console UI: vertical strips, per-strip routing, scoped solo, per-bus output | done — per-bus effect editing is still Master-only |
 
 ## Build
 
@@ -157,9 +158,17 @@ solo silences the other lanes on its bus; a bus solo silences its sibling
 buses) and plug-in delay compensation runs across the whole tree, not just
 per lane. `docs/ROUTING.md` is the full model; the engine API
 (`addBus`/`setBusDestination`/`setLaneDestination`/`setBusSolo`/…) and session
-format 2 are implemented and covered by the headless flags below — the
-console UI to reach it from the app itself has not been built yet, so today
-it is reachable only headlessly:
+format 2 are implemented.
+
+The **Console** tab is where you drive it: vertical channel strips in a
+horizontally scrolling row, lane strips on the left and bus strips on the
+right, each with a name, effect chips, a fader beside a meter, `M`/`S`, and
+its own routing — a destination bus for a lane, a parent bus plus an output
+device and channel offset for a bus. A strip silenced by someone else's solo
+is drawn dimmed with its own `S` still off, a routing edit that would close a
+loop is refused with the loop named, and every meter in the window is driven
+by one 30 Hz timer. The row-based mixer is still there as the **Rows** tab.
+Everything is also reachable headlessly:
 
 ```sh
 $BIN --engine-test 10 --output Loopback --lane "MacBook Pro Microphone" \
