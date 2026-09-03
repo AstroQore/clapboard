@@ -11,7 +11,8 @@ enum HeadlessCommand {
         "--sync-test",
         "--restore-session",
         "--session-dump",
-        "--session-autosave-test"
+        "--session-autosave-test",
+        "--routing-selftest"
     ]
 
     static func matches(_ arguments: [String]) -> Bool {
@@ -28,6 +29,9 @@ enum HeadlessCommand {
         }
         if arguments.contains("--engine-test") {
             EngineSmokeTest.run(arguments: arguments)
+        }
+        if arguments.contains("--routing-selftest") {
+            EngineSmokeTest.runRoutingSelfTest(arguments: arguments)
         }
         if arguments.contains("--sync-test") {
             SyncSmokeTest.run(arguments: arguments)
