@@ -12,6 +12,8 @@ enum HeadlessCommand {
         "--restore-session",
         "--session-dump",
         "--session-autosave-test",
+        "--open-project",
+        "--project-selftest",
         "--hotkeys-selftest",
         "--routing-selftest"
     ]
@@ -42,7 +44,9 @@ enum HeadlessCommand {
         }
         if arguments.contains("--restore-session")
             || arguments.contains("--session-dump")
-            || arguments.contains("--session-autosave-test") {
+            || arguments.contains("--session-autosave-test")
+            || arguments.contains("--open-project")
+            || arguments.contains("--project-selftest") {
             SessionSmokeTest.run(arguments: arguments)
         }
         FileHandle.standardError.write(Data("unknown headless flag\n".utf8))
