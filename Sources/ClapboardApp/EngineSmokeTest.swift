@@ -12,6 +12,14 @@ import Foundation
 ///     Clapboard --engine-test 120 \
 ///         --output "监听" --lane "MacBook Pro Microphone" --lane "Audio Hijack Input" \
 ///         --rebuild-at 20 --hot-lane "Loopback"
+///
+/// `--save-session` writes the resulting lanes and output device to the session
+/// file — `--session-path <file>` for somewhere other than the default — so the
+/// M5 round trip can be driven entirely from a script:
+///
+///     Clapboard --engine-test 5 --output Loopback --lane "…" \
+///         --save-session --session-path /tmp/session.json
+///     Clapboard --restore-session /tmp/session.json
 enum EngineSmokeTest {
     @MainActor
     static func run(arguments: [String]) -> Never {
@@ -21,6 +29,8 @@ enum EngineSmokeTest {
         var hotLaneQuery: String?
         var rebuildAt: Double?
         var ignoreTCC = false
+        var saveSession = false
+        var sessionPath: String?
 
         var index = 0
         while index < arguments.count {
@@ -36,6 +46,8 @@ enum EngineSmokeTest {
             case "--hot-lane": hotLaneQuery = next()
             case "--rebuild-at": rebuildAt = Double(next() ?? "")
             case "--ignore-tcc": ignoreTCC = true
+            case "--save-session": saveSession = true
+            case "--session-path": sessionPath = next()
             default: break
             }
             index += 1
@@ -162,6 +174,18 @@ enum EngineSmokeTest {
             + "dropped=\(engine.droppedBlocks) rebuilds=\(engine.restartCount) "
             + "worstCallbackAge=\(String(format: "%.3f", worstCallbackAge))s "
             + "state=\(engine.runState.label)")
+
+        if saveSession {
+            guard let store = SessionSmokeTest.store(path: sessionPath) else {
+                fail("macOS reports no Application Support directory; pass --session-path")
+            }
+            do {
+                try store.save(engine.sessionSnapshot)
+                say("session  wrote \(engine.lanes.count) lane(s) to \(store.fileURL.path)")
+            } catch {
+                fail("could not write the session: \(error)")
+            }
+        }
 
         engine.shutdown()
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
