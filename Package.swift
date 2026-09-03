@@ -22,6 +22,7 @@ let package = Package(
         // main-actor isolated by default.
         .target(
             name: "ClapboardCore",
+            exclude: ["Sync/README.md"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
