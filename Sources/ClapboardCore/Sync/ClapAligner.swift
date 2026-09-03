@@ -904,6 +904,7 @@ public struct ClapAligner: Sendable {
         result.triangleResidualSamples = solution.triangleResidualRMS
         result.pairs = solution.usedPairs
         result.droppedPairs = solution.droppedPairs
+        result.pairResiduals = solution.pairResiduals
         return result
     }
 
