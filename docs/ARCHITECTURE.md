@@ -9,13 +9,13 @@ README's Status table for the authoritative milestone state.
 
 ```
  Lane devices (USB mics, wireless receivers, Loopback/Audio Hijack, ...)
-       │            │            │
-       ▼            ▼            ▼
- ┌─────────────────────────────────────────────┐
- │   Private Core Audio aggregate device        │   <- one per engine run,
- │   (all lane inputs + the chosen output,      │      created and destroyed
- │    driven by one HAL IOProc)                 │      by AggregateDevice
- └─────────────────────────────────────────────┘
+       │            │            │        Process taps (an app, or all of them)
+       ▼            ▼            ▼            │
+ ┌─────────────────────────────────────────────┐  <- taps join through
+ │   Private Core Audio aggregate device        │     kAudioAggregateDeviceTapListKey
+ │   (all lane inputs + the chosen output,      │      one per engine run,
+ │    driven by one HAL IOProc)                 │      created and destroyed
+ └─────────────────────────────────────────────┘      by AggregateDevice
        │ one interleaved AudioBuffer per stream, delivered together
        ▼
  ┌─────────────────────────────────────────────┐
@@ -91,6 +91,73 @@ Audio rules capture this: any change to the HAL device list means stop →
 rebuild the aggregate → restart, because sub-device removal shifts channel
 offsets silently, and a rebuild can change the drift resampler's latency,
 which is why stored sync delays are marked stale after one.
+
+## Process taps as lane sources
+
+A lane's source is a `LaneSource`, not a device UID
+(`Sources/ClapboardCore/Engine/LaneConfig.swift`):
+
+```swift
+case device(uid: String, channels: [Int])
+case processTap(TapSpec)          // TapSpec: .app(bundleID:) | .systemAudio, name, mono
+```
+
+`.processTap` uses macOS 14.2's `AudioHardwareCreateProcessTap`, so Clapboard
+can take another application's output — or the whole system mix — as an input
+strip with no Loopback, no Audio Hijack and no driver in between. Four things
+make that fit the existing engine rather than sit beside it:
+
+- **Nothing downstream knows the difference.** Both cases expose a
+  `sourceKey` — a real device UID, or `tap:<bundle id>` / `tap:system`, a shape
+  no device UID can have — and a pair of channel indices. `AggregateInputLayout`
+  files a tap's stream under that key exactly as it files a sub-device's, so
+  `AudioEngine.republishGraph` resolves a tap lane's buffer index and channel
+  offset through the same two calls it uses for a microphone, with no case
+  analysis. `LaneConfig.deviceUID`/`deviceChannels` survive as computed shims
+  over `source`, which is why Auto Sync, the row mixer and the session tests
+  needed no changes at all.
+- **Taps live inside the one aggregate device.** `AggregateDevice.create`
+  builds each tap first (`ProcessTapFactory`) and lists it in the composition
+  under `kAudioAggregateDeviceTapListKey`, keyed by `kAudioTapPropertyUID`, with
+  `kAudioSubTapDriftCompensationKey` set — a tap follows whatever device the
+  tapped app plays to, which is not necessarily this aggregate's clock main.
+  The HAL then appends the taps' input streams **after** every sub-device
+  stream: a 1-channel built-in microphone, a 2-channel Loopback and a stereo
+  tap advertise `[1, 2, 2]`. That order is not assumed. It is built, then
+  checked against the aggregate's real `kAudioDevicePropertyStreamConfiguration`
+  on every bring-up, and a mismatch throws
+  (`AggregateDeviceError.tapStreamsMissing`) rather than handing the render
+  thread channel offsets that are fiction — the same discipline the
+  output-side "Loopback contributes buffers ahead of the output device" trap
+  already forced.
+- **A tap that cannot be built is a reason, not silence.** Process object ids
+  are not stable, so nothing about them is persisted: a `TapSpec` names a
+  bundle id and `ProcessTapFactory` re-resolves it through
+  `kAudioHardwarePropertyProcessObjectList` every time. If the app is not
+  playing, or macOS refuses the capture, the aggregate is still built without
+  that tap, the rest of the mix runs, and the lane reports
+  `LaneStatus.deviceMissing` with the sentence in `AudioEngine.laneStatusReason`
+  (see `docs/PERMISSIONS.md`). The description also carries `bundleIDs` with
+  process restore enabled, so a live tap keeps working across the tapped app
+  quitting and relaunching — even an app that spawns a fresh helper per sound.
+  `AudioEngine` additionally listens on `kAudioHardwarePropertyProcessObjectList`
+  and rebuilds for exactly one case: a tap the aggregate does *not* carry whose
+  app has now started playing. Rebuilding on every process-id change would
+  restart the engine several times a second on a busy Mac.
+- **A tap is destroyed the way the aggregate is.** `AggregateDevice.destroy()`
+  destroys the aggregate first and then its taps, so the HAL is never asked to
+  drop a tap an aggregate still names; that runs on stop, on every rebuild, from
+  `deinit`, and through `TerminationGuard`. `ProcessTapFactory.leakedTapUIDs()`
+  intersects the taps this process created and never destroyed with
+  `kAudioHardwarePropertyTapList`, so `--engine-test` can prove the absence of a
+  leak instead of asserting it.
+
+Two design choices worth stating outright, both covered in
+`docs/PERMISSIONS.md`: a system-wide tap **excludes Clapboard's own process**
+(otherwise the mix Clapboard writes to its output device is audio produced by
+this process, and a truly global tap would feed the master back into a lane and
+build a loop one block at a time), and every tap uses `CATapUnmuted`, so
+capturing an app never silences it.
 
 ## The real-time render path
 
@@ -173,9 +240,12 @@ Pipeline (`Sources/ClapboardCore/Sync/`):
    tried first; several strong candidates are tried and the one that aligns
    the most other lanes wins the "reference" role, so one lane catching an
    unrelated bang can't hijack the take. Virtual devices (Loopback, Audio
-   Hijack, a planned process tap) are measured but never selected as the
-   reference, because their timeline is somebody else's clock, not the
-   aggregate's.
+   Hijack) are measured but never selected as the reference, because their
+   timeline is somebody else's clock, not the aggregate's. **A process-tap lane
+   is not yet classified this way** — `SyncSession.refreshLanes` decides
+   "virtual" by looking the lane's `deviceUID` up in the device registry, and a
+   tap's key is not a device UID, so a tap lane is offered and treated as
+   physical. Untick it before measuring; a tap cannot hear a clap.
 4. **Windowing.** Around each lane's onset, a short window is mean-removed,
    RMS-normalised, and tapered with an exponential anchored at the onset so
    late reflections weigh less than the direct sound.
@@ -248,9 +318,13 @@ Clapboard remembers its mixer state in
 `~/Library/Application Support/Clapboard/session.json`
 (`Sources/ClapboardCore/Session/`):
 
-- **Contents:** every lane (device UID, channel indices, name, gain dB,
-  on/off, polarity, delay samples — and their order), the output device UID,
-  and the master gain. Meters and run state are not persisted.
+- **Contents:** every lane (its `source` — a device UID plus channel indices,
+  or a tap's bundle id / "system audio" marker — name, gain dB, on/off,
+  polarity, delay samples, and their order), the output device UID, and the
+  master gain. Meters and run state are not persisted. A tap lane also writes
+  the pre-tap `deviceUID`/`deviceChannels` spelling (`tap:<bundle id>`), so a
+  Clapboard that predates `source` sees a lane on an unknown device — missing,
+  and therefore kept — rather than dropping it and everything keyed on its id.
 - **`formatVersion`:** bumped only when a reader would need to behave
   differently, not for every additive field — an unknown key is ignored by
   design, so adding a field a future build understands and an old one doesn't
@@ -307,9 +381,8 @@ listed here so this document doesn't imply they're already in `main`:
   audio device installed under `/Library/Audio/Plug-Ins/HAL`, so other apps
   can select Clapboard's mix as an input without routing through a physical
   output. Requires administrator rights to install; see `SECURITY.md`.
-- **Process taps** — capturing another app's audio output directly (macOS
-  14+ `AudioHardwareCreateProcessTap`) instead of only physical/virtual
-  devices, which would need its own TCC permission distinct from the
-  Microphone one; see `docs/PERMISSIONS.md`.
 - **Per-lane AU insertion and plug-in delay compensation** — see "Audio Unit
   hosting" above; the hosting core exists, the render-graph wiring does not.
+
+Process taps used to be on this list and no longer are — see § Process taps as
+lane sources above, and `docs/PERMISSIONS.md` for the permission.

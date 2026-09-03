@@ -90,16 +90,76 @@ Clapboard writes only to
 `docs/ARCHITECTURE.md`). No other files are read or written, and no directory
 outside this one is touched.
 
-## Planned: system-audio-capture permission (process taps)
+## System audio capture (process taps)
 
-A planned feature (not implemented — see `docs/ARCHITECTURE.md`) is capturing
-another app's audio output directly via macOS's process-tap APIs
-(`AudioHardwareCreateProcessTap`, macOS 14+) instead of only physical/virtual
-devices. Unlike the Microphone permission, this uses a **separate** TCC
-permission ("audio capture" / screen-and-system-audio-recording family,
-depending on the exact API surface at the time this is implemented) that must
-be requested and granted independently. This document will be updated with
-the concrete flow once that work lands.
+A lane can be fed by another application's audio instead of by an input
+device, through macOS 14.2's Core Audio process taps
+(`AudioHardwareCreateProcessTap` + `CATapDescription`; see
+`docs/ARCHITECTURE.md`). That capture is governed by a **different permission
+from the Microphone one**, and the difference matters in three ways.
+
+### The Info.plist key
+
+`Resources/Info.plist` declares `NSAudioCaptureUsageDescription`. This is the
+key Apple documents for the audio-capture TCC service (`kTCCServiceAudioCapture`
+— `tccutil reset AudioCapture com.astroqore.Clapboard` addresses it), and it is
+what a system prompt would quote if one were raised. It is *not*
+`NSMicrophoneUsageDescription`, and granting one says nothing about the other.
+
+### There is no `requestAccess` for it
+
+`AVCaptureDevice.authorizationStatus(for:)`/`requestAccess(for:)` cover the
+microphone and the camera. There is no public equivalent for audio capture:
+the supported way to find out whether this app may tap is to **create a tap and
+see**. `ProcessTapPermission.probe()` therefore builds a real, private, unmuted
+system-wide tap (excluding Clapboard itself), destroys it immediately, and
+reports the outcome as `SystemAudioAuthorization`. The probe *is* the request —
+on a system that gates taps, the first call is what raises the prompt and a
+later call reports the user's answer.
+
+The engine surfaces this as `AudioEngine.systemAudioAuthorization`, refreshes
+it with `refreshSystemAudioAuthorization()`, and consults it in `start()` **only
+when a lane actually wants a tap** (`AudioEngine.usesProcessTaps`) — a
+microphone-only mix must not be held up by a permission it never uses. In the
+UI it appears at the bottom of the Add Lane sheet's *Application audio* tab,
+with a "Check access" button; `--list-taps` prints it as its first line and
+exits non-zero when it is refused.
+
+### Refusal is reported, never silent
+
+This is the opposite of the microphone's failure mode. Where an unauthorized
+microphone yields digitally silent samples with no error, a refused tap fails
+at `AudioHardwareCreateProcessTap`. `AggregateDevice.create` records the reason
+in `tapFailures` instead of failing the whole aggregate, so the rest of the mix
+runs and the affected lane reports `LaneStatus.deviceMissing` with a sentence in
+`AudioEngine.laneStatusReason` — shown on the console strip and printed by
+`--engine-test` as a `LANE` line. The same path covers "that app is not playing
+anything right now", which is by far the more common case.
+
+### What was actually observed on the development Mac
+
+On macOS 27.0 (build 26A5425a), with `com.astroqore.Clapboard` ad-hoc signed,
+creating a private process tap succeeded **without any prompt**: it still
+succeeded after `tccutil reset AudioCapture com.astroqore.Clapboard`, and it
+still succeeded with `NSAudioCaptureUsageDescription` removed from the bundle
+entirely. The captured audio was real, not silence — the tap lane's meter
+tracks the tapped app.
+
+So on that machine the permission is currently not enforced for this shape of
+tap. The key is declared and the probe is wired anyway, because that is not
+something to rely on: the gate exists on other macOS versions and
+configurations, and the whole point of `ProcessTapPermission` is that Clapboard
+reports a refusal clearly on a machine where it does happen instead of
+capturing nothing and calling it a mix.
+
+### Tapping never mutes the app it captures
+
+`CATapDescription.muteBehavior` is always `CATapUnmuted`. The other two modes
+(`CATapMuted`, `CATapMutedWhenTapped`) stop the tapped application's audio from
+reaching the hardware while the tap is being read. Clapboard is a mixer, not a
+recorder that replaces playback: adding a lane on Music must not silence Music,
+and the way to stop hearing something is that lane's own `M` button. This is
+asserted in `ProcessTapLaneTests`.
 
 ## Admin rights for the virtual-device driver
 

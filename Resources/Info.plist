@@ -24,6 +24,8 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Clapboard captures the audio other apps play so it can mix them alongside your microphones.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
