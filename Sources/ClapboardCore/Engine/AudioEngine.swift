@@ -212,6 +212,83 @@ public final class AudioEngine {
         host.setLaneDelay(lane.id, samples: lane.delaySamples)
     }
 
+    // MARK: - Auto Sync capture
+
+    public enum SyncCaptureError: Error, LocalizedError, Equatable {
+        case engineNotRunning
+        case noLanes
+        case alreadyArmed
+
+        public var errorDescription: String? {
+            switch self {
+            case .engineNotRunning:
+                return "Start the engine before measuring: Auto Sync records what the IOProc is already receiving."
+            case .noLanes:
+                return "Pick at least one lane to record."
+            case .alreadyArmed:
+                return "A capture is already running."
+            }
+        }
+    }
+
+    /// True between `armSyncCapture` and `disarmSyncCapture`.
+    public private(set) var syncCaptureArmed = false
+
+    /// Starts recording every named lane's raw, pre-delay input into a
+    /// pre-allocated buffer. All the allocation happens here, on the main
+    /// thread; the render thread only appends.
+    public func armSyncCapture(laneIDs: [UUID], seconds: Double) throws {
+        guard runState.isRunning else { throw SyncCaptureError.engineNotRunning }
+        guard !syncCaptureArmed else { throw SyncCaptureError.alreadyArmed }
+        let known = lanes.map(\.id).filter { laneIDs.contains($0) }
+        guard !known.isEmpty else { throw SyncCaptureError.noLanes }
+        let bounded = min(max(seconds, 0.5), 20)
+        let frames = max(1, Int((bounded * sampleRate).rounded()))
+        let armed = host.armCapture(laneIDs: known, frames: frames)
+        guard !armed.isEmpty else { throw SyncCaptureError.noLanes }
+        syncCaptureArmed = true
+    }
+
+    /// 0…1, polled by the UI. Reads one atomic.
+    public var syncCaptureProgress: Double {
+        let requested = host.captureRequestedFrames
+        guard requested > 0 else { return 0 }
+        return min(1, Double(host.capturedFrameCount) / Double(requested))
+    }
+
+    /// Frames captured so far, shared by every armed lane.
+    public var syncCapturedFrames: Int { host.capturedFrameCount }
+
+    /// A slice of one lane's capture while it is still running, for the cheap
+    /// main-thread transient watcher that ends a take early.
+    public func syncCapturedSamples(laneID: UUID, from start: Int, count: Int) -> [Float] {
+        host.capturedSamples(for: laneID, from: start, count: count)
+    }
+
+    /// Stops the capture and hands back one array of raw pre-delay samples per
+    /// armed lane, all of them the same length and sharing a time origin.
+    ///
+    /// The render thread reads the arm flag once at the top of a block, so a
+    /// block that started before the flag went down can still be writing:
+    /// this waits for two further callbacks before copying anything out.
+    public func disarmSyncCapture() async -> [UUID: [Float]] {
+        guard syncCaptureArmed else { return [:] }
+        syncCaptureArmed = false
+        host.disarmCapture()
+        let target = host.callbackCount + 2
+        let deadline = Date().addingTimeInterval(0.5)
+        while host.callbackCount < target, Date() < deadline, runState.isRunning {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return host.drainCaptureBuffers()
+    }
+
+    /// Throws the capture away without copying it out. Same timing rule.
+    public func cancelSyncCapture() async {
+        guard syncCaptureArmed else { return }
+        _ = await disarmSyncCapture()
+    }
+
     // MARK: - Meters
 
     public func meter(laneID: UUID) -> MeterReading { host.laneMeter(laneID) }
@@ -409,7 +486,10 @@ public final class AudioEngine {
         ioProc?.stop()
         ioProc = nil
         // Safe now: `AudioDeviceStop` guarantees the block has returned, so
-        // every retired snapshot can be reclaimed.
+        // every retired snapshot — and any Auto Sync capture buffer — can be
+        // reclaimed.
+        host.releaseCaptureBuffers()
+        syncCaptureArmed = false
         host.unpublish()
         aggregate?.destroy()
         aggregate = nil

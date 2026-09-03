@@ -18,6 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--engine-test") {
             EngineSmokeTest.run(arguments: Array(CommandLine.arguments.dropFirst()))
         }
+        if CommandLine.arguments.contains("--sync-test") {
+            SyncSmokeTest.run(arguments: Array(CommandLine.arguments.dropFirst()))
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
     }

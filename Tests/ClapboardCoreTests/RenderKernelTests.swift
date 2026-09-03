@@ -5,7 +5,7 @@ import Testing
 
 /// A heap `AudioBufferList` shaped like the one the HAL hands an IOProc: one
 /// interleaved Float32 buffer per stream.
-private final class BufferListBox {
+final class BufferListBox {
     let streams: [Int]
     let frames: Int
     private let list: UnsafeMutableAudioBufferListPointer
@@ -52,7 +52,7 @@ private final class BufferListBox {
 }
 
 /// One lane, one stereo output stream, driven block by block.
-private final class Rig {
+final class Rig {
     let host = RTEngineHost()
     let input: BufferListBox
     let output: BufferListBox
