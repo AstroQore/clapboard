@@ -17,6 +17,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// back before the process goes away.
     var hotkeys: HotkeyManager?
 
+    /// Set by the scene. Owns which project file the mixer belongs to, so a
+    /// double-clicked `.clapboard` has somewhere to go.
+    var project: ProjectController? {
+        didSet { project?.handleExternalOpen(pendingOpen); pendingOpen = [] }
+    }
+
+    /// Files the Finder handed us before the scene existed. A double-click on a
+    /// project launches the app, and `application(_:open:)` can beat the
+    /// window's `onAppear` to it.
+    private var pendingOpen: [URL] = []
+
     private var observersInstalled = false
     /// Owned here rather than by the scene: an `NSStatusItem` disappears when
     /// its owner is released, and scene state does not outlive the window.
@@ -33,6 +44,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Double-clicking a `.clapboard` file, or `open`-ing one from a shell.
+    /// Only project files are accepted: the document type declared in
+    /// `Info.plist` is the only thing this app knows how to be handed.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let projects = urls.filter { $0.pathExtension == ProjectController.fileExtension }
+        guard !projects.isEmpty else { return }
+        guard let project else {
+            pendingOpen.append(contentsOf: projects)
+            return
+        }
+        project.handleExternalOpen(projects)
+    }
+
+    /// Another app — or another Clapboard window — may have changed the system
+    /// recents list while we were in the background.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        project?.refreshRecents()
     }
 
     /// Last chance to destroy the private aggregate device. Leaving one behind

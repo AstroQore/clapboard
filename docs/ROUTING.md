@@ -1,11 +1,12 @@
 # Routing model (design, v2)
 
-Status: **implemented**, except Projects and the one "Auto-assign a Clapboard
-Bus" action, both marked **not implemented** below. The model (`BusConfig`,
-`RoutingGraph`, `SoloLogic`, `LatencyPlan`), the real-time bus graph, a private
-aggregate device with several output devices, the `AudioEngine` bus API,
-session format 2 with version 1 migration, the console UI, and the headless
-`--engine-test`/`--routing-selftest` coverage below are all in `main`.
+Status: **implemented**, except the one "Auto-assign a Clapboard Bus" action,
+marked **not implemented** below. The model (`BusConfig`, `RoutingGraph`,
+`SoloLogic`, `LatencyPlan`), the real-time bus graph, a private aggregate
+device with several output devices, the `AudioEngine` bus API, session format 2
+with version 1 migration, named projects, the console UI, and the headless
+`--engine-test`/`--routing-selftest`/`--project-selftest` coverage below are all
+in `main`.
 `docs/ARCHITECTURE.md`'s signal-flow diagram still shows the pre-bus
 single-master shape and needs updating to match this document; treat this file
 as authoritative for routing until then.
@@ -129,20 +130,52 @@ the component is not installed on this Mac, or macOS refused to host it. Its
 so opening a session on a machine without the plug-in and saving it again
 cannot throw the settings away.
 
-## Projects — not implemented
+## Projects
 
 The autosaved session stays where it is (`~/Library/Application Support/
-Clapboard/session.json`) and is what opens on launch. In addition:
+Clapboard/session.json`) and is what opens when no project has been saved yet.
+A project is the *same document* written somewhere the user chose:
 
-- **Save As…** writes the same document to a user-chosen `.clapboard` file
-  (JSON, same schema, UTI `com.astroqore.clapboard.project`).
-- **Open…** loads one, replaces the live graph (engine stops, restores,
-  restarts), and makes it the autosave target until another project is
-  opened or "Detach from project" is chosen.
-- **Open Recent** keeps the last ten paths (`NSDocumentController` recents
-  are fine to reuse even without going document-based).
-- The title bar shows the project name and a dirty marker when the live graph
-  differs from the file on disk.
+- **Save As…** (⇧⌘S) writes `engine.sessionSnapshot` through a
+  `SessionStore(fileURL:)` to a `.clapboard` file — JSON, same schema, UTI
+  `com.astroqore.clapboard.project`, exported in `Info.plist` and conforming to
+  `public.json`, so it gets an icon and opens on a double-click.
+- **Open…** (⌘O) loads one and replaces the live graph. The engine stops,
+  restores and restarts if it was running, which is `AudioEngine.restore`'s
+  own behaviour: every intermediate state (no lanes, wrong output device)
+  stays off the render thread. A file that does not parse surfaces the
+  quarantine error rather than opening an empty mixer in silence.
+- **New** (⌘N) stops the engine, empties the mixer back to a single `Master`,
+  detaches from the project file and goes back to autosaving the default
+  session. Because that last step overwrites the default session a second
+  later, it asks first whenever there is anything to lose — unsaved changes
+  *or* a mixer that is about to be thrown away — and names the file it is
+  about to write.
+- **Save** (⌘S) is the flush: autosave is debounced by a second, and this is
+  how you make it happen now.
+- **Open Recent** is macOS's own list — `NSDocumentController`'s
+  `noteNewRecentDocumentURL(_:)` going in and `recentDocumentURLs` coming back,
+  so the File menu and the Dock menu cannot disagree — capped at the last ten,
+  with a **Clear Menu** item. An entry whose file has been moved or deleted
+  reports that and drops out of the list instead of failing quietly.
+
+**The autosave target follows the project.** While one is open, the one-second
+debounce writes *that* file; the default session keeps whatever it had. The
+path is remembered, so the next launch reopens it — and if it has since been
+moved or deleted, Clapboard falls back to the default session and says so in
+the project bar rather than starting somewhere else without a word.
+
+There is exactly one change-tracking mechanism behind all of this.
+`SessionController` still owns the debounce, the dirty flag and every byte
+written; `ProjectController` owns only *identity* — which file, what it is
+called, what was opened lately — and moves the target with
+`retarget(to:dirty:)`, `adopt(_:into:)` and `write(to:)`. The window's edited
+dot (`NSWindow.isDocumentEdited`) reads the same flag the autosave does, so the
+title bar and the debounce can never disagree; the window title is
+`<project name> — Clapboard` and the file is the window's represented URL, which
+is what gives the proxy icon. `Clapboard --project-selftest` drives the whole
+round trip — save, mutate, prove the write landed in the project and not the
+default session, New, reopen, compare — inside a temporary directory.
 
 ## Virtual devices
 

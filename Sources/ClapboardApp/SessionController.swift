@@ -10,6 +10,11 @@ import Observation
 /// master gain. Meters, callback counts and run state are observable too and
 /// change dozens of times a second; they are deliberately not read here, so
 /// dragging a fader writes one file, not sixty.
+///
+/// *Which* file that is belongs to `ProjectController`: opening a project
+/// retargets this controller (`retarget(to:dirty:)`) rather than starting a
+/// second autosave beside it. There is one debounce, one dirty flag and one
+/// writer in the app, whether or not a project is open.
 @MainActor
 @Observable
 final class SessionController {
@@ -28,11 +33,23 @@ final class SessionController {
     /// build understands it, and saving will rewrite it in this build's format.
     private(set) var loadedNewerFormat = false
 
-    @ObservationIgnored private let store: SessionStore?
+    /// The file autosave writes. `nil` only when macOS reported no Application
+    /// Support directory and no explicit store was given.
+    ///
+    /// A `var` because a project *is* the autosave target while it is open;
+    /// see `retarget(to:dirty:)`.
+    private(set) var store: SessionStore?
+
+    /// True while the live graph differs from what is on disk in `store`.
+    ///
+    /// Observable because the window's edited dot reads it. It is deliberately
+    /// the same flag the debounce uses: a title bar that could disagree with
+    /// what autosave believes would be worse than no title bar at all.
+    private(set) var isDirty = false
+
     @ObservationIgnored private weak var engine: AudioEngine?
     @ObservationIgnored private var pendingSave: DispatchWorkItem?
     @ObservationIgnored private var isRestoring = false
-    @ObservationIgnored private var isDirty = false
     /// State a newer Clapboard wrote that this one does not model. Carried
     /// from load to save untouched so an older build cannot erase it. The
     /// effect-chain key is excluded: this build owns it, and carrying it would
@@ -70,6 +87,9 @@ final class SessionController {
     /// Loads the file and restores it into `engine`, then starts watching for
     /// changes. Restoring must not itself trigger a save, so tracking only
     /// begins once the engine is back in shape.
+    ///
+    /// `ProjectController.attach` may have pointed `store` at a project file
+    /// first; this loads whatever it is aimed at, with no idea which.
     func attach(engine: AudioEngine) {
         self.engine = engine
         guard let store else {
@@ -82,14 +102,56 @@ final class SessionController {
             report(lastLoadError!)
         }
         if let document {
-            carriedLaneExtras = document.laneExtras
-            carriedMasterExtras = document.masterExtras
-            loadedNewerFormat = document.isFromNewerFormat
-            isRestoring = true
-            restoreReport = engine.restore(document)
-            isRestoring = false
+            adopt(document, into: engine)
         }
         beginTracking()
+    }
+
+    // MARK: - Retargeting
+
+    /// Points autosave at another file.
+    ///
+    /// Any debounced write is cancelled first: it was aimed at the document the
+    /// user has just left, and letting it land after the switch would write one
+    /// project's mixer into another project's file.
+    ///
+    /// - Parameter dirty: `true` when the live graph is already known to differ
+    ///   from `newStore`'s contents — `New`, which empties the mixer and then
+    ///   expects that empty mixer to reach the default session file.
+    func retarget(to newStore: SessionStore?, dirty: Bool) {
+        pendingSave?.cancel()
+        pendingSave = nil
+        store = newStore
+        lastSaveError = nil
+        lastLoadError = nil
+        loadedNewerFormat = false
+        isDirty = false
+        // Deliberately not `noteChange()`: that is guarded against changes
+        // arriving *during* a restore, and `New` retargets immediately after
+        // one. The caller saying "this graph differs from that file" is not the
+        // thing the guard is there to catch.
+        if dirty, store != nil { scheduleSave() }
+    }
+
+    /// Replaces the live graph with `document` without the restore counting as
+    /// an edit, and adopts the extras bags that came with the file.
+    @discardableResult
+    func adopt(_ document: SessionDocument, into engine: AudioEngine) -> SessionRestoreReport {
+        self.engine = engine
+        carriedLaneExtras = document.laneExtras
+        carriedMasterExtras = document.masterExtras
+        loadedNewerFormat = document.isFromNewerFormat
+        isRestoring = true
+        let report = engine.restore(document)
+        restoreReport = report
+        isDirty = false
+        // `onChange` fires during the restore but re-arms on the *next*
+        // main-actor turn, so it reads `isRestoring` after this call has
+        // returned. Clearing the flag synchronously here would let the
+        // restore's own mutations arrive one turn later as a user edit and
+        // dirty a project the moment it was opened.
+        Task { @MainActor [weak self] in self?.isRestoring = false }
+        return report
     }
 
     // MARK: - Saving
@@ -105,10 +167,41 @@ final class SessionController {
     func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
-        guard let store, let engine else { return }
-        // The snapshot already carries this build's effect chains; everything
-        // else a newer Clapboard left in the bags is merged back in, minus
-        // extras belonging to lanes that no longer exist.
+        guard let store else { return }
+        switch write(to: store) {
+        case .success(let document):
+            isDirty = false
+            lastSaveError = nil
+            lastSavedAt = document.savedAt
+            saveCount += 1
+        case .failure(let error):
+            lastSaveError = String(describing: error)
+            report("session save failed: \(lastSaveError!)")
+        }
+    }
+
+    /// Writes the current graph to `destination` right now, without changing
+    /// where autosave points. `Save As` uses this before retargeting, so a
+    /// failed write leaves the app attached to the file it was already on.
+    @discardableResult
+    func write(to destination: SessionStore) -> Result<SessionDocument, any Error> {
+        guard let engine else {
+            return .failure(SessionStoreError.writeFailed(
+                url: destination.fileURL, reason: "no engine is attached"))
+        }
+        let document = mergedSnapshot(engine)
+        do {
+            try destination.save(document)
+            return .success(document)
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// The engine's snapshot with anything a newer Clapboard left in the extras
+    /// bags merged back in, minus extras belonging to lanes that no longer
+    /// exist. The snapshot already carries this build's effect chains.
+    private func mergedSnapshot(_ engine: AudioEngine) -> SessionDocument {
         var document = engine.sessionSnapshot
         let ids = Set(engine.lanes.map(\.id.uuidString))
         for (laneID, bag) in carriedLaneExtras where ids.contains(laneID) {
@@ -121,16 +214,7 @@ final class SessionController {
         where key != EffectChainCodec.extrasKey && document.masterExtras[key] == nil {
             document.masterExtras[key] = value
         }
-        do {
-            try store.save(document)
-            isDirty = false
-            lastSaveError = nil
-            lastSavedAt = document.savedAt
-            saveCount += 1
-        } catch {
-            lastSaveError = String(describing: error)
-            report("session save failed: \(lastSaveError!)")
-        }
+        return document
     }
 
     // MARK: - Change tracking
@@ -138,7 +222,10 @@ final class SessionController {
     private func beginTracking() {
         guard let engine else { return }
         withObservationTracking {
-            // Exactly the session's contents — nothing that ticks.
+            // Exactly the session's contents — nothing that ticks. `buses` is
+            // read transitively: `masterGainDB`, `outputDeviceUID` and
+            // `masterEffects` are all computed off it, so every bus edit is
+            // tracked without naming it here.
             _ = engine.lanes
             _ = engine.outputDeviceUID
             _ = engine.masterGainDB
@@ -162,6 +249,12 @@ final class SessionController {
 
     private func noteChange() {
         guard !isRestoring, store != nil else { return }
+        scheduleSave()
+    }
+
+    /// Marks the graph dirty and arms the debounce. `noteChange` is this plus
+    /// the "not while restoring" guard.
+    private func scheduleSave() {
         isDirty = true
         pendingSave?.cancel()
         let work = DispatchWorkItem { [weak self] in
