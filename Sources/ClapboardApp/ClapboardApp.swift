@@ -11,6 +11,8 @@ struct ClapboardApp: App {
     @State private var session = SessionController()
     @State private var project = ProjectController()
     @State private var hotkeys = HotkeyManager()
+    @State private var onboarding = OnboardingController()
+    @State private var driverInstaller = DriverInstaller()
 
     var body: some Scene {
         WindowGroup("Clapboard") {
@@ -58,9 +60,23 @@ struct ClapboardApp: App {
                     appDelegate.hotkeys = hotkeys
                     appDelegate.installStatusItem(engine: engine, hotkeys: hotkeys)
                 }
+                // First-run setup assistant, plus the banner for a driver that
+                // is installed but not loaded. Presents itself; never blocks.
+                .modifier(SetupPresentation(
+                    onboarding: onboarding,
+                    installer: driverInstaller,
+                    permission: permission,
+                    registry: registry,
+                    engine: engine
+                ))
         }
         .defaultSize(width: 1100, height: 700)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Divider()
+                Button("Show Setup Assistant") { onboarding.present(at: .welcome) }
+                Button("Set Up Virtual Devices…") { onboarding.present(at: .virtualDevices) }
+            }
             // File. `replacing:` rather than `after:` so SwiftUI's own "New
             // Window" does not sit next to a New that means something else.
             CommandGroup(replacing: .newItem) {

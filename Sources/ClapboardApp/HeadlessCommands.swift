@@ -16,7 +16,8 @@ enum HeadlessCommand {
         "--project-selftest",
         "--hotkeys-selftest",
         "--routing-selftest",
-        "--list-taps"
+        "--list-taps",
+        "--driver-status"
     ]
 
     static func matches(_ arguments: [String]) -> Bool {
@@ -33,6 +34,9 @@ enum HeadlessCommand {
         }
         if arguments.contains("--effects-list") {
             printEffectsAndExit()
+        }
+        if arguments.contains("--driver-status") {
+            DriverStatusCommand.run()
         }
         if arguments.contains("--engine-test") {
             EngineSmokeTest.run(arguments: arguments)
