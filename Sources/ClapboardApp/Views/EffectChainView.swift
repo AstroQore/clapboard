@@ -11,24 +11,22 @@ import SwiftUI
 struct EffectChainView: View {
     /// Which chain is on screen.
     ///
-    /// `AudioEngine`'s chain-editing API addresses a lane by id and the master
-    /// bus by `nil`, which is why those two are editable and any other bus is
-    /// not: a chain saved on one round-trips through the session file intact
-    /// but has no engine API to edit it (`docs/ROUTING.md` § Session format 2).
-    /// Showing it read-only is how the console says so out loud instead of
-    /// pretending the bus has no plug-ins.
+    /// Every strip's chain is editable — `AudioEngine`'s chain API names an
+    /// `EffectTarget`, and a lane and a bus are equally addressable. `.master`
+    /// is only here because the row-based mixer still says "the master chain"
+    /// rather than naming a bus; it resolves to `.bus(masterBusID)` like any
+    /// other bus strip.
     enum Subject: Hashable {
         case lane(UUID)
         case master
         case bus(UUID)
 
-        /// The `laneID` convention `AudioEngine.addEffect(_:toLane:)` uses, or
-        /// `nil` for a chain this build cannot edit.
-        var editableLaneID: UUID?? {
+        @MainActor
+        func target(in engine: AudioEngine) -> EffectTarget {
             switch self {
-            case .lane(let id): return .some(.some(id))
-            case .master: return .some(nil)
-            case .bus: return nil
+            case .lane(let id): return .lane(id)
+            case .master: return engine.masterEffectTarget
+            case .bus(let id): return .bus(id)
             }
         }
     }
@@ -50,15 +48,9 @@ struct EffectChainView: View {
         self.axis = axis
     }
 
-    private var chain: [EffectConfig] {
-        switch subject {
-        case .lane(let id): return engine.effects(forLane: id)
-        case .master: return engine.masterEffects
-        case .bus(let id): return engine.bus(id: id)?.effects ?? []
-        }
-    }
+    private var target: EffectTarget { subject.target(in: engine) }
 
-    private var isEditable: Bool { subject.editableLaneID != nil }
+    private var chain: [EffectConfig] { engine.effects(for: target) }
 
     var body: some View {
         Group {
@@ -69,9 +61,7 @@ struct EffectChainView: View {
             }
         }
         .sheet(isPresented: $showingPicker) {
-            if let laneID = subject.editableLaneID {
-                EffectPickerSheet(engine: engine, laneID: laneID)
-            }
+            EffectPickerSheet(engine: engine, target: target)
         }
     }
 
@@ -90,7 +80,6 @@ struct EffectChainView: View {
                 effect: effect,
                 index: index,
                 count: chain.count,
-                isEditable: isEditable,
                 fillsWidth: axis == .vertical
             )
         }
@@ -108,11 +97,8 @@ struct EffectChainView: View {
             }
         }
         .buttonStyle(.borderless)
-        .help(isEditable
-              ? "Insert an Audio Unit"
-              : "Per-bus effect editing is not implemented yet — see docs/ROUTING.md. "
-                + "A chain saved on this bus is kept and re-saved, but cannot be edited here.")
-        .disabled(!isEditable || chain.count >= RTLimits.maxEffectsPerChain)
+        .help("Insert an Audio Unit")
+        .disabled(chain.count >= RTLimits.maxEffectsPerChain)
 
         if engine.restoringEffects {
             ProgressView()
@@ -157,9 +143,6 @@ private struct EffectChipView: View {
     let effect: EffectConfig
     let index: Int
     let count: Int
-    /// False on a bus whose chain has no engine API to edit; the chip is then
-    /// a read-out, not a control.
-    var isEditable: Bool = true
     /// Console strips are 120 pt wide, so a chip there fills the column rather
     /// than sizing to its name.
     var fillsWidth: Bool = false
@@ -187,8 +170,7 @@ private struct EffectChipView: View {
             .foregroundStyle(foreground)
             .help(helpText)
             .modifier(EffectChipInteraction(engine: engine, effect: effect, index: index,
-                                            count: count, isEditable: isEditable,
-                                            hovering: $hovering))
+                                            count: count, hovering: $hovering))
     }
 
     private var chip: some View {
@@ -203,7 +185,7 @@ private struct EffectChipView: View {
                     .foregroundStyle(.tertiary)
             }
             if fillsWidth { Spacer(minLength: 0) }
-            if hovering, isEditable {
+            if hovering {
                 Button {
                     engine.removeEffect(id: effect.id)
                 } label: {
@@ -233,58 +215,50 @@ private struct EffectChipView: View {
         if let reason = effect.unavailableReason { return "\(effect.displayName) — \(reason)" }
         return "\(effect.displayName)\(effect.bypass ? " (bypassed)" : "")"
             + " · \(latency) samples latency"
-            + (isEditable
-               ? " · click to bypass, double-click for its editor"
-               : " · read-only: per-bus effect editing is not implemented yet")
+            + " · click to bypass, double-click for its editor"
     }
 }
 
-/// The click, hover and menu behaviour of an editable chip.
+/// The click, hover and menu behaviour of a chip.
 ///
-/// Split out so a read-only chip on a non-master bus is genuinely inert — no
-/// tap gesture that silently does nothing, no context menu full of disabled
-/// items — rather than a control that looks live and is not.
+/// Split out from the chip's appearance so the two can be read separately;
+/// every chain — lane or bus — gets it, because every chain is editable.
 private struct EffectChipInteraction: ViewModifier {
     let engine: AudioEngine
     let effect: EffectConfig
     let index: Int
     let count: Int
-    let isEditable: Bool
     @Binding var hovering: Bool
 
     func body(content: Content) -> some View {
-        if isEditable {
-            content
-                .onHover { hovering = $0 }
-                // Order matters: SwiftUI matches the higher count first, so the
-                // single-click bypass never swallows a double-click.
-                .onTapGesture(count: 2) {
-                    guard effect.isAvailable else { return }
-                    engine.openEffectWindow(id: effect.id)
-                }
-                .onTapGesture {
-                    guard effect.isAvailable else { return }
+        content
+            .onHover { hovering = $0 }
+            // Order matters: SwiftUI matches the higher count first, so the
+            // single-click bypass never swallows a double-click.
+            .onTapGesture(count: 2) {
+                guard effect.isAvailable else { return }
+                engine.openEffectWindow(id: effect.id)
+            }
+            .onTapGesture {
+                guard effect.isAvailable else { return }
+                engine.setEffectBypass(id: effect.id, !effect.bypass)
+            }
+            .contextMenu {
+                Button("Open Editor") { engine.openEffectWindow(id: effect.id) }
+                    .disabled(!effect.isAvailable)
+                Button(effect.bypass ? "Enable" : "Bypass") {
                     engine.setEffectBypass(id: effect.id, !effect.bypass)
                 }
-                .contextMenu {
-                    Button("Open Editor") { engine.openEffectWindow(id: effect.id) }
-                        .disabled(!effect.isAvailable)
-                    Button(effect.bypass ? "Enable" : "Bypass") {
-                        engine.setEffectBypass(id: effect.id, !effect.bypass)
-                    }
-                    .disabled(!effect.isAvailable)
-                    Divider()
-                    Button("Move Earlier") { engine.moveEffect(id: effect.id, to: index - 1) }
-                        .disabled(index == 0)
-                    Button("Move Later") { engine.moveEffect(id: effect.id, to: index + 1) }
-                        .disabled(index >= count - 1)
-                    Divider()
-                    Button("Remove", role: .destructive) { engine.removeEffect(id: effect.id) }
-                }
-                .onDeleteCommand { engine.removeEffect(id: effect.id) }
-        } else {
-            content
-        }
+                .disabled(!effect.isAvailable)
+                Divider()
+                Button("Move Earlier") { engine.moveEffect(id: effect.id, to: index - 1) }
+                    .disabled(index == 0)
+                Button("Move Later") { engine.moveEffect(id: effect.id, to: index + 1) }
+                    .disabled(index >= count - 1)
+                Divider()
+                Button("Remove", role: .destructive) { engine.removeEffect(id: effect.id) }
+            }
+            .onDeleteCommand { engine.removeEffect(id: effect.id) }
     }
 }
 
@@ -293,7 +267,8 @@ private struct EffectChipInteraction: ViewModifier {
 /// The plug-in menu: search, grouped by manufacturer with Apple first.
 struct EffectPickerSheet: View {
     let engine: AudioEngine
-    let laneID: UUID?
+    /// The strip the chosen plug-in is appended to — a lane or any bus.
+    let target: EffectTarget
 
     @Environment(\.dismiss) private var dismiss
     @State private var entries: [Entry] = []
@@ -341,9 +316,20 @@ struct EffectPickerSheet: View {
         .task { await load() }
     }
 
+    /// Named after the strip rather than "lane"/"bus", so adding to `Drums`
+    /// says `Drums` and the Master bus keeps the wording it always had.
+    private var title: String {
+        switch target {
+        case .lane(let id):
+            return "Add \(engine.lane(id: id)?.name ?? "Lane") Effect"
+        case .bus(let id):
+            return "Add \(engine.bus(id: id)?.name ?? "Bus") Effect"
+        }
+    }
+
     private var header: some View {
         HStack {
-            Text(laneID == nil ? "Add Master Effect" : "Add Lane Effect")
+            Text(title)
                 .font(.headline)
             Spacer()
             TextField("Search", text: $search)
@@ -433,7 +419,7 @@ struct EffectPickerSheet: View {
         Task { @MainActor in
             defer { inserting = nil }
             do {
-                _ = try await engine.addEffect(entry.info, toLane: laneID)
+                _ = try await engine.addEffect(entry.info, to: target)
                 dismiss()
             } catch {
                 failure = String(describing: error)

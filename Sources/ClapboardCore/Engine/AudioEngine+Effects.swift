@@ -1,16 +1,22 @@
 import Foundation
 
-/// Audio Unit chains: one per lane, one on the master bus.
+/// Audio Unit chains: one per lane and one per bus, master included.
 ///
-/// A lane's chain sits after the delay line and before the fader; the master
-/// chain sits after the sum and before the master fader. Editing either while
-/// the engine runs is a graph snapshot swap, the same click-free mechanism
-/// adding a lane uses, and the plug-ins themselves outlive it — they are owned
-/// by `RTEngineHost` and only torn down once the render thread has provably
-/// left every snapshot that could reach them.
+/// A lane's chain sits after the delay line and before the fader; a bus's
+/// chain sits after the sum (and after the bus's own PDC delay line) and
+/// before the bus fader. Editing either while the engine runs is a graph
+/// snapshot swap, the same click-free mechanism adding a lane uses, and the
+/// plug-ins themselves outlive it — they are owned by `RTEngineHost` and only
+/// torn down once the render thread has provably left every snapshot that
+/// could reach them.
+///
+/// Every entry point takes an `EffectTarget`. The older `toLane laneID: UUID?`
+/// spelling, where `nil` meant the master bus and no other bus could be named,
+/// survives as a shim below.
 extension AudioEngine {
     public enum EffectError: Error, LocalizedError, Equatable {
         case unknownLane
+        case unknownBus
         case chainFull(Int)
         case unknownEffect
 
@@ -18,6 +24,8 @@ extension AudioEngine {
             switch self {
             case .unknownLane:
                 return "That lane is gone."
+            case .unknownBus:
+                return "That bus is gone."
             case .chainFull(let limit):
                 return "A chain holds at most \(limit) effects."
             case .unknownEffect:
@@ -32,28 +40,42 @@ extension AudioEngine {
     /// The engine refuses to run at anything but 48 kHz anyway.
     public static var effectSampleRate: Double { 48_000 }
 
+    /// A bus is a stereo sum, so its plug-ins are always instantiated with two
+    /// channels — unlike a lane's, which follow the lane's own channel count.
+    static var busEffectChannels: Int { 2 }
+
     // MARK: - Reading a chain
 
-    /// `nil` means the master bus, the same convention `addEffect` uses.
-    public func effects(forLane laneID: UUID?) -> [EffectConfig] {
-        guard let laneID else { return masterEffects }
-        return laneEffects[laneID] ?? []
+    /// The chain on one strip, in order.
+    public func effects(for target: EffectTarget) -> [EffectConfig] {
+        switch target {
+        case .lane(let laneID): return laneEffects[laneID] ?? []
+        case .bus(let busID): return bus(id: busID)?.effects ?? []
+        }
     }
 
+    /// The strip the master shims (`masterEffects`, `masterGainDB`,
+    /// `setOutputDevice`) point at, as an `EffectTarget` — what a UI written
+    /// against "the master chain" passes to `addEffect(_:to:)`.
+    public var masterEffectTarget: EffectTarget { .bus(masterBusID) }
+
     public func effectConfig(id: UUID) -> EffectConfig? {
-        if let index = masterEffects.firstIndex(where: { $0.id == id }) { return masterEffects[index] }
         for chain in laneEffects.values {
             if let found = chain.first(where: { $0.id == id }) { return found }
+        }
+        for bus in buses {
+            if let found = bus.effects.first(where: { $0.id == id }) { return found }
         }
         return nil
     }
 
-    /// The lane an effect belongs to, or `nil` for the master chain. The outer
-    /// optional distinguishes "not found" from "on the master".
-    public func laneOwning(effect id: UUID) -> UUID?? {
-        if masterEffects.contains(where: { $0.id == id }) { return .some(nil) }
+    /// Which strip an effect is on, or `nil` when nothing in the mixer has it.
+    public func target(ofEffect id: UUID) -> EffectTarget? {
         for (laneID, chain) in laneEffects where chain.contains(where: { $0.id == id }) {
-            return .some(laneID)
+            return .lane(laneID)
+        }
+        for bus in buses where bus.effects.contains(where: { $0.id == id }) {
+            return .bus(bus.id)
         }
         return nil
     }
@@ -69,22 +91,23 @@ extension AudioEngine {
 
     // MARK: - Editing
 
-    /// Loads a plug-in and appends it to a chain. `laneID == nil` is the
-    /// master bus.
+    /// Loads a plug-in and appends it to a strip's chain.
     ///
     /// Instantiation is `async` because `AUAudioUnit.instantiate` is, and it
-    /// is not quick: a large plug-in takes hundreds of milliseconds. The lane
-    /// can disappear while it loads, which is why the lane is checked twice.
+    /// is not quick: a large plug-in takes hundreds of milliseconds. The strip
+    /// can disappear while it loads, which is why it is checked twice.
     @discardableResult
-    public func addEffect(_ info: AUComponentInfo, toLane laneID: UUID?) async throws -> EffectConfig {
+    public func addEffect(_ info: AUComponentInfo, to target: EffectTarget) async throws -> EffectConfig {
         let channels: Int
-        if let laneID {
+        switch target {
+        case .lane(let laneID):
             guard let lane = lane(id: laneID) else { throw EffectError.unknownLane }
             channels = max(1, min(2, lane.deviceChannels.count))
-        } else {
-            channels = 2
+        case .bus(let busID):
+            guard bus(id: busID) != nil else { throw EffectError.unknownBus }
+            channels = AudioEngine.busEffectChannels
         }
-        guard effects(forLane: laneID).count < RTLimits.maxEffectsPerChain else {
+        guard effects(for: target).count < RTLimits.maxEffectsPerChain else {
             throw EffectError.chainFull(RTLimits.maxEffectsPerChain)
         }
 
@@ -94,14 +117,22 @@ extension AudioEngine {
             sampleRate: AudioEngine.effectSampleRate,
             maximumFrames: RTLimits.maxFramesPerBlock
         )
-        guard laneID == nil || lane(id: laneID!) != nil else {
+        guard stripExists(target) else {
             instance.teardown()
-            throw EffectError.unknownLane
+            throw target.isLane ? EffectError.unknownLane : EffectError.unknownBus
         }
 
         let config = EffectConfig(componentID: info.id, displayName: info.displayName)
-        insert(instance, config: config, intoLane: laneID, at: nil)
+        insert(instance, config: config, into: target, at: nil)
         return config
+    }
+
+    /// Is the lane or bus this target names still in the mixer?
+    func stripExists(_ target: EffectTarget) -> Bool {
+        switch target {
+        case .lane(let laneID): return lane(id: laneID) != nil
+        case .bus(let busID): return bus(id: busID) != nil
+        }
     }
 
     /// Registers an already-instantiated plug-in and republishes. Shared by
@@ -109,23 +140,19 @@ extension AudioEngine {
     func insert(
         _ instance: AUEffectInstance,
         config: EffectConfig,
-        intoLane laneID: UUID?,
+        into target: EffectTarget,
         at index: Int?
     ) {
         host.registerEffect(id: config.id, instance: instance, channels: instance.laneChannels)
         host.setEffectBypass(id: config.id, config.bypass)
         // A plug-in may change its latency at any time — a linear-phase EQ
         // switching mode, a limiter whose look-ahead is a parameter — and
-        // every lane's compensation is computed from it.
+        // every strip's compensation is computed from it.
         instance.onLatencyChange = { [weak self] _ in
             self?.pushEffectiveDelays()
         }
-        if let laneID {
-            var chain = laneEffects[laneID] ?? []
+        editChain(on: target) { chain in
             chain.insert(config, at: min(max(0, index ?? chain.count), chain.count))
-            laneEffects[laneID] = chain
-        } else {
-            masterEffects.insert(config, at: min(max(0, index ?? masterEffects.count), masterEffects.count))
         }
         republishGraph()
         pushEffectiveDelays()
@@ -134,24 +161,28 @@ extension AudioEngine {
     /// Adds a placeholder for a plug-in this Mac cannot load. It is shown
     /// greyed, is not published to the render thread, and keeps its saved
     /// state so the next save does not throw the settings away.
-    func insertPlaceholder(_ config: EffectConfig, intoLane laneID: UUID?) {
-        if let laneID {
+    func insertPlaceholder(_ config: EffectConfig, into target: EffectTarget) {
+        editChain(on: target) { $0.append(config) }
+    }
+
+    /// The one place a chain is mutated in place, so lanes (which keep theirs
+    /// in `laneEffects`) and buses (which carry theirs inline on `BusConfig`)
+    /// cannot drift apart. A lane with an empty chain drops its dictionary
+    /// entry, the way it always has.
+    private func editChain(on target: EffectTarget, _ body: (inout [EffectConfig]) -> Void) {
+        switch target {
+        case .lane(let laneID):
             var chain = laneEffects[laneID] ?? []
-            chain.append(config)
-            laneEffects[laneID] = chain
-        } else {
-            masterEffects.append(config)
+            body(&chain)
+            laneEffects[laneID] = chain.isEmpty ? nil : chain
+        case .bus(let busID):
+            mutateBus(busID) { body(&$0.effects) }
         }
     }
 
     public func removeEffect(id: UUID) {
-        guard let owner = laneOwning(effect: id) else { return }
-        if let laneID = owner {
-            laneEffects[laneID]?.removeAll { $0.id == id }
-            if laneEffects[laneID]?.isEmpty == true { laneEffects[laneID] = nil }
-        } else {
-            masterEffects.removeAll { $0.id == id }
-        }
+        guard let target = target(ofEffect: id) else { return }
+        editChain(on: target) { $0.removeAll { $0.id == id } }
         host.discardEffect(id: id)
         republishGraph()
         pushEffectiveDelays()
@@ -161,38 +192,28 @@ extension AudioEngine {
     /// Moves an effect inside its own chain. Order matters — a compressor
     /// before an EQ is a different sound from an EQ before a compressor — but
     /// nothing here can move an effect between chains: a plug-in is
-    /// instantiated for its lane's channel count.
+    /// instantiated for its strip's channel count.
     public func moveEffect(id: UUID, to index: Int) {
-        guard let owner = laneOwning(effect: id) else { return }
-        func reorder(_ chain: inout [EffectConfig]) {
+        guard let target = target(ofEffect: id) else { return }
+        editChain(on: target) { chain in
             guard let from = chain.firstIndex(where: { $0.id == id }) else { return }
             let clamped = min(max(0, index), chain.count - 1)
             guard clamped != from else { return }
             let entry = chain.remove(at: from)
             chain.insert(entry, at: clamped)
         }
-        if let laneID = owner {
-            var chain = laneEffects[laneID] ?? []
-            reorder(&chain)
-            laneEffects[laneID] = chain
-        } else {
-            reorder(&masterEffects)
-        }
         republishGraph()
     }
 
     /// Bypass is a host-level pass-through, not `AUAudioUnit.shouldBypassEffect`:
     /// leaving the plug-in rendering would keep its latency, so toggling it
-    /// would shift the lane against the others. That does mean bypass changes
+    /// would shift the strip against the others. That does mean bypass changes
     /// the chain's latency, so compensation is recomputed here.
     public func setEffectBypass(id: UUID, _ bypass: Bool) {
-        guard let owner = laneOwning(effect: id) else { return }
-        if let laneID = owner {
-            if let position = laneEffects[laneID]?.firstIndex(where: { $0.id == id }) {
-                laneEffects[laneID]?[position].bypass = bypass
-            }
-        } else if let position = masterEffects.firstIndex(where: { $0.id == id }) {
-            masterEffects[position].bypass = bypass
+        guard let target = target(ofEffect: id) else { return }
+        editChain(on: target) { chain in
+            guard let position = chain.firstIndex(where: { $0.id == id }) else { return }
+            chain[position].bypass = bypass
         }
         host.setEffectBypass(id: id, bypass)
         pushEffectiveDelays()
@@ -203,6 +224,43 @@ extension AudioEngine {
     public func openEffectWindow(id: UUID) {
         guard let instance = host.effectInstance(id: id) else { return }
         onShowEffectWindow?(instance)
+    }
+
+    // MARK: - Pre-`EffectTarget` spelling
+
+    // These are the entry points that existed while only lanes and the master
+    // bus could carry an editable chain, with `nil` standing in for the master.
+    // They are thin forwards onto the `EffectTarget` API — kept, not removed,
+    // so the row-based mixer and the headless smoke tests need no edit. New
+    // code should name its target.
+    //
+    // Deliberately not marked `@available(*, deprecated:)`: `ClapboardApp`'s
+    // `--engine-test`/`--restore-session` still call them, and a build full of
+    // deprecation warnings hides the ones that matter.
+
+    /// `nil` means the master bus. Prefer `effects(for:)`.
+    public func effects(forLane laneID: UUID?) -> [EffectConfig] {
+        effects(for: laneID.map(EffectTarget.lane) ?? masterEffectTarget)
+    }
+
+    /// `nil` means the master bus. Prefer `addEffect(_:to:)`.
+    @discardableResult
+    public func addEffect(_ info: AUComponentInfo, toLane laneID: UUID?) async throws -> EffectConfig {
+        try await addEffect(info, to: laneID.map(EffectTarget.lane) ?? masterEffectTarget)
+    }
+
+    /// The lane an effect belongs to, or `nil` for the master chain. The outer
+    /// optional distinguishes "not found" from "on the master".
+    ///
+    /// Cannot describe a chain on any other bus — it returns `nil` (i.e. "not
+    /// found") for one, which is the whole reason `target(ofEffect:)` replaced
+    /// it. Prefer that.
+    public func laneOwning(effect id: UUID) -> UUID?? {
+        switch target(ofEffect: id) {
+        case .lane(let laneID): return .some(.some(laneID))
+        case .bus(let busID) where busID == masterBusID: return .some(nil)
+        default: return nil
+        }
     }
 
     // MARK: - Plug-in delay compensation

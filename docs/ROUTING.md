@@ -114,13 +114,18 @@ itself is read for version 1 migration and otherwise always written empty,
 since a bus's chain now travels on `BusConfig.effects` instead, master
 included.
 
-One scope note beyond what shipped: only the Master bus's chain is
-loaded back into a live Audio Unit instance on restore (`addEffect(toLane:)`
-covers lanes and Master; nothing yet offers per-bus effect editing for any
-other bus). A chain saved on a non-master bus still round-trips — its
-`EffectConfig`s, including `fullState`, come back exactly as saved — but as a
-placeholder, the same "state kept, not live" contract an uninstalled plug-in
-already gets.
+Every bus's chain is loaded back into live Audio Unit instances on restore,
+Master included: `AudioEngine`'s chain API addresses an `EffectTarget`
+(`.lane(id)` or `.bus(id)`), and `restore` instantiates one plug-in per saved
+`EffectConfig` for every strip, keeping the saved id so per-effect data stays
+attached across a relaunch. Bus plug-ins are instantiated with two channels —
+a bus is a stereo sum — while a lane's follow the lane's own channel count.
+
+A placeholder therefore means one thing only, on a bus exactly as on a lane:
+the component is not installed on this Mac, or macOS refused to host it. Its
+`EffectConfig`, `fullState` included, is kept and written back out unchanged,
+so opening a session on a machine without the plug-in and saving it again
+cannot throw the settings away.
 
 ## Projects — not implemented
 
@@ -202,12 +207,16 @@ Four things the console does that are worth stating explicitly:
   the engine, republish, and dirty the session. Every setter in a strip
   compares first.
 
+A bus strip's effect chips are the same control a lane's are: click to bypass,
+double-click for the plug-in's own editor, context menu to reorder or remove,
+and a working `+` that opens the plug-in picker (headed with the strip's own
+name). Nothing about the Master bus's chain is special any more — the strip
+draws it through `EffectChainView` with the subject `.bus(id)`, master
+included — and the `PDC +N sp` read-out under the chain says how much delay
+this bus is carrying to stay level with its siblings.
+
 Scope notes:
 
-- Per-bus **effect editing** is still only Master's. `AudioEngine`'s chain API
-  addresses a lane by id and the master bus by `nil`, and session restore only
-  instantiates those two (§ Session format 2), so a non-master bus's chips are
-  shown read-only with the `+` disabled and a tooltip that says why.
 - The row-based mixer is kept beside the console as the **Rows** tab. It is
   unchanged and still runs against the Master bus only, via the thin shims
   `AudioEngine` keeps for it (`setOutputDevice`, `masterGainDB`,

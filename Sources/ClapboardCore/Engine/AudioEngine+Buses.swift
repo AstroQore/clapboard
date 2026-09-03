@@ -66,9 +66,14 @@ extension AudioEngine {
             lanes[laneID].destinationBus = fallback
         }
         buses.remove(at: index)
+        // The bus's plug-ins go the same way its runtime does — and the same
+        // way `removeLane` sends a lane's: detached now, freed only once the
+        // render thread has provably left the snapshot that named them.
+        for effect in removed.effects { host.discardEffect(id: effect.id) }
         host.discardBusRuntime(for: id)
         applyTopologyChange()
         pushEffectiveDelays()
+        drainRetiredEffects()
         return .success(())
     }
 
@@ -129,8 +134,7 @@ extension AudioEngine {
     public func busMeter(id: UUID) -> MeterReading { host.busMeter(id) }
 
     /// Samples of latency this bus's own chain adds — the bus-level analogue
-    /// of `laneChainLatency(_:)`. A bus this task hasn't given its own effect
-    /// chain (every bus but the master, today) is simply `0`.
+    /// of `laneChainLatency(_:)`. A bus with no chain is simply `0`.
     public func busChainLatency(_ busID: UUID) -> Int {
         chainLatency(bus(id: busID)?.effects ?? [])
     }
@@ -182,9 +186,9 @@ extension AudioEngine {
     }
 
     /// Is this the bus the `masterGainDB` / `masterMeter` / `masterEffects` /
-    /// `setOutputDevice` shims point at? The console asks because that bus is
-    /// the only one whose effect chain can be edited today, and because
-    /// `removeBus` will refuse it.
+    /// `setOutputDevice` shims point at? The console asks because `removeBus`
+    /// will refuse it, and because the strip is drawn with an accent. Its
+    /// effect chain is not special: every bus carries an editable one.
     public func isMasterBus(_ id: UUID) -> Bool { id == masterBusID }
 
     /// The loop that routing `id` into `parent` would close, named strip by

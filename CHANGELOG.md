@@ -61,15 +61,32 @@ yet.
   `--bus`/`--route`/`--bus-parent`/`--bus-output`/`--solo`/`--mute` on
   `--engine-test`, and `--routing-selftest`, which builds a two-output-device
   bus tree and checks it end to end.
+- **Per-bus effect chains**: every bus carries an editable Audio Unit chain,
+  not just Master. `AudioEngine`'s chain API now names an `EffectTarget`
+  (`.lane(id)` / `.bus(id)`) instead of the old "a lane id, or `nil` for the
+  master bus" convention — `addEffect(_:to:)`, `effects(for:)`,
+  `target(ofEffect:)`, `masterEffectTarget`, with `removeEffect`/`moveEffect`/
+  `setEffectBypass`/`openEffectWindow` resolving the target from the effect
+  id. Bus plug-ins are instantiated with two channels (a bus is a stereo
+  sum); lanes keep their own channel count. Session restore instantiates a
+  live plug-in for every bus's saved chain, so a placeholder now means only
+  what it means on a lane — the component is missing, or macOS refused to
+  host it — and still keeps its `fullState` so re-saving cannot lose it.
+  Removing a bus tears its chain down on the same snapshot-generation terms
+  `removeLane` uses. In the console, a bus strip's chips are editable and its
+  `+` works, exactly like a lane's. `addEffect(_:toLane:)` and
+  `effects(forLane:)` remain as thin forwards.
 
 ### Known limitations
 
 - No console UI for buses yet: the row-based mixer still runs against the
   Master bus only, through the shims above. Routing is reachable today only
   through the `AudioEngine` API and the headless flags.
-- Per-bus effect editing exists only for the Master bus; a chain saved on any
-  other bus round-trips through a session file but comes back as a
-  placeholder rather than a live plug-in (`docs/ROUTING.md`).
+- `--engine-test` can insert an effect into a lane (`--lane-effect`) or the
+  Master bus (`--master-effect`), but has no flag for a chain on any other
+  bus; drive one through the `AudioEngine` API or a session file and
+  `--restore-session`, which prints every bus's chain and whether each entry
+  came back loaded.
 - Projects (Save As / Open / Open Recent / a dirty-state title bar) are
   designed in `docs/ROUTING.md` but not implemented.
 - Global hotkeys, a virtual-device driver, and process-tap system-audio

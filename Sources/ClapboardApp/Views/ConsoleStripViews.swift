@@ -572,11 +572,11 @@ private struct BusStripControls: View {
 
         Divider()
 
-        EffectChainView(
-            engine: engine,
-            subject: isMaster ? .master : .bus(bus.id),
-            axis: .vertical
-        )
+        // A bus strip's chain is edited exactly like a lane's — insert,
+        // reorder, bypass, remove, open the plug-in's own window. The master
+        // bus is not a special case here: `.bus(masterBusID)` and `.master`
+        // name the same chain.
+        EffectChainView(engine: engine, subject: .bus(bus.id), axis: .vertical)
 
         latencyReadouts
     }
