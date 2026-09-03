@@ -5,21 +5,25 @@ import Foundation
 public struct AggregateDeviceRequest: Hashable, Sendable {
     /// Lane source devices, in the order their channels should appear.
     public var inputDeviceUIDs: [String]
-    /// Clock main and mix destination. Never also an input.
-    public var outputDeviceUID: String
+    /// Output devices, in priority order. The first becomes the aggregate's
+    /// clock main (`kAudioAggregateDeviceMainSubDeviceKey`, and the clock
+    /// device when the HAL accepts it); every one of them is a mix
+    /// destination some bus may write to. Never also an input. At least one
+    /// is required.
+    public var outputDeviceUIDs: [String]
     public var sampleRate: Double
     public var bufferFrameSize: UInt32
     public var name: String
 
     public init(
         inputDeviceUIDs: [String],
-        outputDeviceUID: String,
+        outputDeviceUIDs: [String],
         sampleRate: Double = 48_000,
         bufferFrameSize: UInt32 = 256,
         name: String = "Clapboard Mix"
     ) {
         self.inputDeviceUIDs = inputDeviceUIDs
-        self.outputDeviceUID = outputDeviceUID
+        self.outputDeviceUIDs = outputDeviceUIDs
         self.sampleRate = sampleRate
         self.bufferFrameSize = bufferFrameSize
         self.name = name
@@ -27,6 +31,7 @@ public struct AggregateDeviceRequest: Hashable, Sendable {
 }
 
 public enum AggregateDeviceError: Error, CustomStringConvertible, Sendable {
+    case noOutputDevices
     case deviceNotFound(uid: String)
     case deviceHasNoInput(name: String)
     case deviceHasNoOutput(name: String)
@@ -40,6 +45,8 @@ public enum AggregateDeviceError: Error, CustomStringConvertible, Sendable {
 
     public var description: String {
         switch self {
+        case .noOutputDevices:
+            return "At least one output device is required."
         case .deviceNotFound(let uid):
             return "No audio device with UID \(uid) — it was unplugged or renamed."
         case .deviceHasNoInput(let name):
@@ -78,17 +85,19 @@ public final class AggregateDevice {
     public let uid: String
     public let name: String
     public let inputDeviceUIDs: [String]
-    public let outputDeviceUID: String
+    /// Every output device the aggregate carries, in priority order. The
+    /// first is the clock main (`kAudioAggregateDeviceMainSubDeviceKey`).
+    public let outputDeviceUIDs: [String]
     public let sampleRate: Double
     public let bufferFrameSize: UInt32
 
     /// Where each sub-device's input channels land in the IOProc input list.
     public let inputLayout: AggregateInputLayout
-    /// Same arithmetic for the output list.
+    /// Same arithmetic for the output list. An *input* sub-device that also
+    /// exposes output streams (Loopback always does) contributes buffers here
+    /// ahead of every requested output device, so a bus's buffer index is
+    /// always looked up by device UID — never assumed — via `outputSlot`.
     public let outputLayout: AggregateStreamLayout
-    /// Buffer in the IOProc output list that belongs to the output device.
-    public let masterOutputBufferIndex: Int
-    public let masterOutputChannels: Int
     /// True when the HAL accepted `kAudioAggregateDeviceClockDeviceKey`.
     public let usedClockDeviceKey: Bool
 
@@ -99,27 +108,42 @@ public final class AggregateDevice {
         uid: String,
         name: String,
         inputDeviceUIDs: [String],
-        outputDeviceUID: String,
+        outputDeviceUIDs: [String],
         sampleRate: Double,
         bufferFrameSize: UInt32,
         inputLayout: AggregateInputLayout,
         outputLayout: AggregateStreamLayout,
-        masterOutputBufferIndex: Int,
-        masterOutputChannels: Int,
         usedClockDeviceKey: Bool
     ) {
         self.objectID = objectID
         self.uid = uid
         self.name = name
         self.inputDeviceUIDs = inputDeviceUIDs
-        self.outputDeviceUID = outputDeviceUID
+        self.outputDeviceUIDs = outputDeviceUIDs
         self.sampleRate = sampleRate
         self.bufferFrameSize = bufferFrameSize
         self.inputLayout = inputLayout
         self.outputLayout = outputLayout
-        self.masterOutputBufferIndex = masterOutputBufferIndex
-        self.masterOutputChannels = masterOutputChannels
         self.usedClockDeviceKey = usedClockDeviceKey
+    }
+
+    /// This output device's slot in the IOProc output buffer list — the
+    /// buffer index and channel count a bus targeting it needs. `nil` when
+    /// `uid` is not one of this aggregate's output devices.
+    ///
+    /// Deliberately a lookup by UID rather than an assumed index: an input
+    /// sub-device that also has output streams (Loopback) contributes output
+    /// buffers ahead of the requested output devices, so the only correct
+    /// source of truth is the sub-devices' actual stream configuration.
+    public func outputSlot(forDeviceUID uid: String) -> AggregateStreamLayout.Slot? {
+        outputLayout.slots.first { $0.deviceUID == uid }
+    }
+
+    /// The first (clock-main) output device's slot — what the render graph
+    /// used before more than one output device existed, and still what a
+    /// single-output engine run wants.
+    public var masterOutputSlot: AggregateStreamLayout.Slot? {
+        outputDeviceUIDs.first.flatMap(outputSlot(forDeviceUID:))
     }
 
     deinit { destroy() }
@@ -135,10 +159,13 @@ public final class AggregateDevice {
     /// One-line description for the UI / logs.
     public var summary: String {
         let inputs = inputLayout.slots.map { "\($0.deviceUID)[\($0.channelCount)]" }.joined(separator: " ")
+        let outputs = outputDeviceUIDs.map { uid -> String in
+            guard let slot = outputSlot(forDeviceUID: uid) else { return "\(uid)[?]" }
+            return "\(uid)[buf=\(slot.bufferIndex)/\(slot.channelCount)ch]"
+        }.joined(separator: " ")
         return "\(name) id=\(objectID) rate=\(Int(sampleRate)) buffer=\(bufferFrameSize) "
             + "in=\(inputLayout.totalChannels)ch(\(inputLayout.bufferCount) streams) "
-            + "outBuffer=\(masterOutputBufferIndex)/\(masterOutputChannels)ch "
-            + "clockKey=\(usedClockDeviceKey) | \(inputs)"
+            + "clockKey=\(usedClockDeviceKey) | in: \(inputs) | out: \(outputs)"
     }
 
     // MARK: - Creation
@@ -154,18 +181,25 @@ public final class AggregateDevice {
         }
 
         // --- Validate the request before touching any hardware.
-        let output = try lookup(request.outputDeviceUID)
-        guard output.hasOutput else { throw AggregateDeviceError.deviceHasNoOutput(name: output.name) }
+        guard !request.outputDeviceUIDs.isEmpty else { throw AggregateDeviceError.noOutputDevices }
+        var outputUIDs: [String] = []
+        var seenOutputs = Set<String>()
+        for uid in request.outputDeviceUIDs where !seenOutputs.contains(uid) {
+            seenOutputs.insert(uid)
+            let device = try lookup(uid)
+            guard device.hasOutput else { throw AggregateDeviceError.deviceHasNoOutput(name: device.name) }
+            outputUIDs.append(uid)
+        }
 
         var seen = Set<String>()
         var inputUIDs: [String] = []
         for uid in request.inputDeviceUIDs where !seen.contains(uid) {
             seen.insert(uid)
             let device = try lookup(uid)
-            guard uid != request.outputDeviceUID else {
+            guard !outputUIDs.contains(uid) else {
                 throw AggregateDeviceError.deviceRejected(
                     name: device.name,
-                    reason: "it is the output device; using it as a lane source would feed the mix back into itself"
+                    reason: "it is one of the output devices; using it as a lane source would feed the mix back into itself"
                 )
             }
             guard !device.transport.isAggregate else {
@@ -181,21 +215,25 @@ public final class AggregateDevice {
         // --- Put every sub-device on the same nominal rate first. An
         // aggregate whose members disagree either fails to start or resamples
         // behind our back.
-        let orderedUIDs = inputUIDs + [request.outputDeviceUID]
+        let orderedUIDs = inputUIDs + outputUIDs
         for uid in orderedUIDs {
             try align(device: try lookup(uid), to: request.sampleRate)
         }
         devices = try AudioDeviceInfo.enumerateAll()
 
-        // --- Build the description. Inputs get drift compensation; the main
-        // sub-device (the output) is the clock and must not be resampled.
+        // --- Build the description. Inputs get drift compensation; so does
+        // every output device except the first, which is the clock main and
+        // must not be resampled against itself.
         var subDeviceList: [[String: Any]] = inputUIDs.map {
             [kAudioSubDeviceUIDKey: $0, kAudioSubDeviceDriftCompensationKey: 1]
         }
-        subDeviceList.append([
-            kAudioSubDeviceUIDKey: request.outputDeviceUID,
-            kAudioSubDeviceDriftCompensationKey: 0
-        ])
+        for (index, uid) in outputUIDs.enumerated() {
+            subDeviceList.append([
+                kAudioSubDeviceUIDKey: uid,
+                kAudioSubDeviceDriftCompensationKey: index == 0 ? 0 : 1
+            ])
+        }
+        let clockMainUID = outputUIDs[0]
 
         let aggregateUID = "com.astroqore.Clapboard.aggregate.\(UUID().uuidString)"
         var description: [String: Any] = [
@@ -204,7 +242,7 @@ public final class AggregateDevice {
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceIsStackedKey: 0,
             kAudioAggregateDeviceSubDeviceListKey: subDeviceList,
-            kAudioAggregateDeviceMainSubDeviceKey: request.outputDeviceUID
+            kAudioAggregateDeviceMainSubDeviceKey: clockMainUID
         ]
 
         // `kAudioAggregateDeviceClockDeviceKey` wants the UID of an
@@ -212,7 +250,7 @@ public final class AggregateDevice {
         // drivers publish a matching clock — but fall back to plain main
         // sub-device clocking rather than shipping a device that never runs.
         var usedClockDeviceKey = true
-        description[kAudioAggregateDeviceClockDeviceKey] = request.outputDeviceUID
+        description[kAudioAggregateDeviceClockDeviceKey] = clockMainUID
         var objectID = AudioObjectID(kAudioObjectUnknown)
         var status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &objectID)
         if status != noErr || objectID == kAudioObjectUnknown || !hasActiveSubDevices(objectID) {
@@ -282,11 +320,15 @@ public final class AggregateDevice {
             )
         }
 
-        // --- The master mix goes to the *output device's* first output
-        // stream, which is not buffer 0 when an input sub-device also has
-        // output streams (Loopback devices always do).
-        guard let masterSlot = outputLayout.slots.first(where: { $0.deviceUID == request.outputDeviceUID }) else {
-            throw AggregateDeviceError.outputStreamNotFound(uid: request.outputDeviceUID)
+        // --- Every requested output device must have produced a stream. Its
+        // buffer index is whatever the actual stream configuration says, not
+        // an assumed position: an *input* sub-device that also exposes output
+        // streams (Loopback always does) contributes buffers ahead of every
+        // output device we asked for.
+        for uid in outputUIDs {
+            guard outputLayout.slots.contains(where: { $0.deviceUID == uid }) else {
+                throw AggregateDeviceError.outputStreamNotFound(uid: uid)
+            }
         }
 
         created = true
@@ -295,13 +337,11 @@ public final class AggregateDevice {
             uid: aggregateUID,
             name: request.name,
             inputDeviceUIDs: inputUIDs,
-            outputDeviceUID: request.outputDeviceUID,
+            outputDeviceUIDs: outputUIDs,
             sampleRate: actualRate,
             bufferFrameSize: actualBuffer,
             inputLayout: inputLayout,
             outputLayout: outputLayout,
-            masterOutputBufferIndex: masterSlot.bufferIndex,
-            masterOutputChannels: masterSlot.channelCount,
             usedClockDeviceKey: usedClockDeviceKey
         )
     }

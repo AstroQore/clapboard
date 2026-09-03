@@ -508,7 +508,7 @@ public final class AudioEngine {
         let inputUIDs = orderedInputDeviceUIDs()
         let device = try AggregateDevice.create(AggregateDeviceRequest(
             inputDeviceUIDs: inputUIDs,
-            outputDeviceUID: outputDeviceUID,
+            outputDeviceUIDs: [outputDeviceUID],
             sampleRate: 48_000,
             bufferFrameSize: 256,
             name: "Clapboard Mix"
@@ -691,6 +691,7 @@ public final class AudioEngine {
             ))
         }
         laneStatus = status
+        let masterSlot = aggregate.masterOutputSlot
         host.publish(
             laneNodes: nodes,
             laneBusIDs: lanes.map { _ in masterBusID },
@@ -698,9 +699,9 @@ public final class AudioEngine {
             buses: [RTEngineHost.BusPublishInfo(
                 id: masterBusID,
                 parentID: nil,
-                outputBufferIndex: aggregate.masterOutputBufferIndex,
+                outputBufferIndex: masterSlot?.bufferIndex ?? -1,
                 outputChannelOffset: 0,
-                outputChannelsInBuffer: aggregate.masterOutputChannels,
+                outputChannelsInBuffer: masterSlot?.channelCount ?? 0,
                 effectIDs: publishableEffectIDs(masterEffects)
             )]
         )
