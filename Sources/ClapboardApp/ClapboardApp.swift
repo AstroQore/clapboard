@@ -13,6 +13,7 @@ struct ClapboardApp: App {
     @State private var hotkeys = HotkeyManager()
     @State private var onboarding = OnboardingController()
     @State private var driverInstaller = DriverInstaller()
+    @State private var updates = AppUpdateController()
 
     var body: some Scene {
         WindowGroup("Clapboard") {
@@ -72,7 +73,25 @@ struct ClapboardApp: App {
         }
         .defaultSize(width: 1100, height: 700)
         .commands {
+            // Right under About, where a windowed Mac app puts it, above the
+            // setup-assistant entries that were already the app menu's own.
             CommandGroup(after: .appInfo) {
+                Divider()
+                if let reason = updates.unavailableReason {
+                    // A greyed-out item with no explanation reads as a bug.
+                    Text(reason)
+                } else {
+                    Button("Check for Updates…") { updates.checkForUpdates() }
+                        .disabled(!updates.canCheckForUpdates)
+                    Menu("Update Channel") {
+                        Picker("Update Channel", selection: updateChannelBinding) {
+                            ForEach(UpdateChannel.allCases) { channel in
+                                Text(channel.label).tag(channel)
+                            }
+                        }
+                        .pickerStyle(.inline)
+                    }
+                }
                 Divider()
                 Button("Show Setup Assistant") { onboarding.present(at: .welcome) }
                 Button("Set Up Virtual Devices…") { onboarding.present(at: .virtualDevices) }
@@ -124,5 +143,11 @@ struct ClapboardApp: App {
         Settings {
             HotkeysSettingsView(hotkeys: hotkeys, engine: engine)
         }
+    }
+
+    /// `AppUpdateController.channel` is `private(set)` because changing it also
+    /// has to reset Sparkle's update cycle; the menu goes through `setChannel`.
+    private var updateChannelBinding: Binding<UpdateChannel> {
+        Binding(get: { updates.channel }, set: { updates.setChannel($0) })
     }
 }

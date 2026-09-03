@@ -56,6 +56,32 @@ intentionally empty (no App Sandbox, no hardened runtime) because Clapboard
 hosts third-party Audio Unit plug-ins in-process. A non-empty entitlements
 dump means something changed that shouldn't have.
 
+### Dependencies
+
+Clapboard has exactly one: [Sparkle](https://github.com/sparkle-project/Sparkle),
+which powers **Clapboard › Check for Updates…**. Three things follow from that,
+and CI checks all three:
+
+- It is pinned to an **exact** version in `Package.swift`, because
+  `Package.resolved` is git-ignored and the pin is the only thing making two
+  builds of one commit contain the same Sparkle. Bumping it is a deliberate
+  change, with its own PR.
+- `Scripts/build_app.sh` embeds `Sparkle.framework` in `Contents/Frameworks`
+  and signs its XPC services, `Autoupdate` and `Updater.app` **before** the app
+  bundle. Signing anything after the outer bundle invalidates the app's
+  signature and `codesign --verify --deep --strict` fails.
+- Its license ships in the bundle
+  (`Resources/ThirdPartyLicenses/Sparkle.txt`, listed in
+  `THIRD_PARTY_NOTICES.md`). Any future dependency needs the same treatment.
+
+`Tests/ClapboardCoreTests/UpdateFeedContractTests.swift` asserts this contract
+against the repository, so a change that breaks it fails `swift test` rather
+than someone's launch.
+
+Never generate, print, commit or paste a Sparkle **private** key. `RELEASING.md`
+explains the key pair and the `SPARKLE_ED_PRIVATE_KEY` repository secret; the
+public key in `Resources/Info.plist` is the only half that belongs in git.
+
 ### Running the app
 
 Always run the built `.app`, never `swift run`:
@@ -153,6 +179,9 @@ Before opening a PR, confirm:
       or a headless-command repro in the PR description where a test isn't.
 - [ ] `CHANGELOG.md` has an entry under `Unreleased` if the change is
       user-visible.
+- [ ] A change that adds or bumps a dependency updates `Package.swift`,
+      `THIRD_PARTY_NOTICES.md` and `Resources/ThirdPartyLicenses/`, and no
+      private key material of any kind is in the diff.
 
 ## Scope of this repository
 

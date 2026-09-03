@@ -26,9 +26,51 @@ clap on every lane and writes the compensating delay into each one.
 | M8 Console UI: vertical strips, per-strip routing, scoped solo, per-bus output | done — per-bus effect editing is still Master-only |
 | M9 Process taps as lane sources (capture another app, or all system audio) | done — the audio-capture permission was never enforced on the development Mac; see `docs/PERMISSIONS.md` |
 
+## Install and updates
+
+Download the `.zip` from the [latest release][releases], unzip it, and drag
+`Clapboard.app` into `/Applications`.
+
+Clapboard is **ad-hoc signed and not notarized** — there is no Apple Developer
+Program membership behind it — so the first launch has to be a **right-click ›
+Open** (or an approval in System Settings › Privacy & Security). A plain
+double-click will be refused by Gatekeeper. The download's `.sha256` sits
+beside it on the release page if you want to check what you got.
+
+### Updates
+
+Clapboard updates itself through [Sparkle][sparkle], on two channels:
+
+| | |
+|---|---|
+| **Main** | stable releases only — the default |
+| **Dev** | preview releases **plus** every Main release |
+
+Pick one in **Clapboard › Update Channel**, and check on demand with
+**Clapboard › Check for Updates…**. Clapboard checks once a day, asks before it
+installs anything, and never installs in the background — a mixer must not swap
+itself out from under a live session.
+
+Every update is signed with an EdDSA key and verified *before* it is unpacked,
+which is what makes an unnotarized download safe to accept. The public key
+lives in `Resources/Info.plist`; the private key never touches this repository.
+`RELEASING.md` has the whole pipeline.
+
+**One rough edge, unavoidable while builds are ad-hoc signed:** an ad-hoc
+signature is derived from the binary's own hash, so every update looks to macOS
+like a different app. Expect the **microphone prompt to come back after an
+update** — and if it does not come back but the meters sit at silence, macOS
+has a stale denied entry: `tccutil reset Microphone com.astroqore.Clapboard`,
+then relaunch. `docs/PERMISSIONS.md` explains why.
+
+[releases]: https://github.com/AstroQore/clapboard/releases
+[sparkle]: https://sparkle-project.org
+
 ## Build
 
 Requires macOS 26 and Xcode 26 (Swift 6.2). Pure SwiftPM, no Xcode project.
+One dependency: [Sparkle][sparkle], pinned to an exact version, embedded into
+the bundle by `Scripts/build_app.sh` and signed before the app is.
 
 ```sh
 swift build
@@ -412,7 +454,12 @@ Two ways out:
 
 The app is unsandboxed and does not enable the hardened runtime, on purpose:
 it hosts third-party AUv2 plug-ins in-process, which library validation would
-block. `Resources/Clapboard.entitlements` is intentionally empty.
+block. `Resources/Clapboard.entitlements` is intentionally empty. (Sparkle's
+own helper executables *are* signed with the hardened runtime — they are
+separate binaries that never host a plug-in.)
+
+Released builds are ad-hoc signed too, which is why an in-app update re-prompts
+for the microphone; see "Install and updates" above and `RELEASING.md`.
 
 ## Layout
 
@@ -428,10 +475,13 @@ Driver/Sources               ClapboardDriver.driver, a Core Audio AudioServerPlu
 Driver/Harness               offline driver tests — no coreaudiod, no install
 Driver/Packaging             pkgbuild/productbuild scripts and installer resources
 Sources/ClapboardApp/Hotkeys  global shortcuts, key recorder, menu-bar item
-Scripts/build_app.sh          bundle + sign .build/Clapboard.app
+Sources/ClapboardApp/AppUpdateController.swift  Sparkle updater + channel choice
+Scripts/build_app.sh          bundle + sign .build/Clapboard.app (incl. Sparkle)
 Scripts/build_driver.sh       build + sign + test .build/ClapboardDriver.driver
 Scripts/build_driver_pkg.sh   wrap the driver into .build/ClapboardDriver.pkg
 Scripts/install_driver.sh     validate and install (or print what to run)
+Scripts/release_app.sh        zip + checksum + signed appcast item for one tag
+Scripts/generate_update_feed.sh  rebuild the shared two-channel appcast
 ```
 
 ## Status, contributing, and license
@@ -454,5 +504,5 @@ also read `CODE_OF_CONDUCT.md` and, for anything security-sensitive,
 ## License
 
 AGPL-3.0-only. See `LICENSE` for the full text and `THIRD_PARTY_NOTICES.md`
-for what this project depends on (currently: nothing beyond Apple's system
-frameworks).
+for what this project depends on — Sparkle (MIT), which is redistributed
+inside the app bundle, and otherwise nothing beyond Apple's system frameworks.

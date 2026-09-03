@@ -29,13 +29,47 @@ if [[ ! -x "$EXEC_PATH" ]]; then
     exit 1
 fi
 
+# Sparkle arrives as a binary artifact of the SwiftPM package, not as
+# something the compiler produced, so it has to be found rather than derived
+# from the bin path.
+SPARKLE_FRAMEWORK_SOURCE="$(
+    find "$ROOT/.build/artifacts/sparkle" \
+        -type d \
+        -path '*/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework' \
+        -print \
+        -quit
+)"
+if [[ -z "$SPARKLE_FRAMEWORK_SOURCE" \
+    || ! -x "$SPARKLE_FRAMEWORK_SOURCE/Versions/B/Sparkle" ]]; then
+    echo "Sparkle framework artifact not found after SwiftPM build." >&2
+    echo "Run 'swift package resolve' and try again." >&2
+    exit 1
+fi
+
 APP_DIR="$ROOT/.build/Clapboard.app"
 ENTITLEMENTS="$ROOT/Resources/Clapboard.entitlements"
+SPARKLE_FRAMEWORK="$APP_DIR/Contents/Frameworks/Sparkle.framework"
 echo "==> packaging $APP_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/Frameworks"
 cp "$EXEC_PATH" "$APP_DIR/Contents/MacOS/Clapboard"
 cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+# ditto, not cp -R: a framework is a symlink farm (Versions/Current, the
+# top-level Sparkle stub) and cp would flatten it into an unsignable copy.
+# The executable finds it through the @loader_path/../Frameworks rpath added
+# in Package.swift.
+ditto "$SPARKLE_FRAMEWORK_SOURCE" "$SPARKLE_FRAMEWORK"
+# Sparkle is MIT-licensed and redistributed inside this bundle, so its notice
+# travels with the binary rather than only with the repository.
+cp "$ROOT/THIRD_PARTY_NOTICES.md" \
+    "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp -R "$ROOT/Resources/ThirdPartyLicenses" \
+    "$APP_DIR/Contents/Resources/ThirdPartyLicenses"
+if [[ ! -f "$APP_DIR/Contents/Resources/ThirdPartyLicenses/Sparkle.txt" ]]; then
+    echo "Packaged third-party license resources are incomplete." >&2
+    exit 1
+fi
 if [[ -f "$ROOT/Resources/AppIcon.icns" ]]; then
     cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
@@ -121,6 +155,37 @@ if [[ ! -f "$ENTITLEMENTS" ]]; then
     echo "Entitlements file not found at $ENTITLEMENTS" >&2
     exit 1
 fi
+
+# --- Sparkle's helper executables ---------------------------------------------
+#
+# Signed one at a time, innermost first, and always BEFORE the outer bundle:
+# codesign seals whatever it finds, so a helper signed afterwards invalidates
+# the app's own signature and `--verify --deep --strict` fails.
+#
+# Downloader.xpc keeps its own entitlements (it is the sandboxed half of
+# Sparkle: it is the only component that talks to the network, and re-signing
+# it without --preserve-metadata=entitlements would drop the sandbox and its
+# network-client entitlement).
+#
+# The helpers do take the hardened runtime even though the app deliberately
+# does not: they are separate binaries with separate signatures, they never
+# host an AUv2 plug-in, and library validation there costs nothing.
+SPARKLE_VERSION_DIR="$SPARKLE_FRAMEWORK/Versions/B"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    SPARKLE_SIGN_ARGS=(--force --sign - --options runtime)
+else
+    SPARKLE_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY" --options runtime)
+fi
+
+echo "==> signing Sparkle helper components"
+codesign "${SPARKLE_SIGN_ARGS[@]}" "$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc"
+codesign \
+    "${SPARKLE_SIGN_ARGS[@]}" \
+    --preserve-metadata=entitlements \
+    "$SPARKLE_VERSION_DIR/XPCServices/Downloader.xpc"
+codesign "${SPARKLE_SIGN_ARGS[@]}" "$SPARKLE_VERSION_DIR/Autoupdate"
+codesign "${SPARKLE_SIGN_ARGS[@]}" "$SPARKLE_VERSION_DIR/Updater.app"
+codesign "${SPARKLE_SIGN_ARGS[@]}" "$SPARKLE_FRAMEWORK"
 
 if [[ "$SIGN_IDENTITY" == "-" ]]; then
     echo "==> ad-hoc codesign (microphone permission will not survive rebuilds; see header)"

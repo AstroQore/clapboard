@@ -1,5 +1,8 @@
 name: Build GitHub Release
 
+# Pushing a v* tag, or re-running an existing tag by hand. Either way this
+# only ever produces a DRAFT release: nothing reaches a user, and nothing
+# reaches the update feed, until a maintainer publishes it.
 on:
   push:
     tags:
@@ -10,6 +13,14 @@ on:
         description: Existing v-prefixed tag to package
         required: true
         type: string
+      channel:
+        description: Sparkle update channel
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - dev
 
 permissions:
   contents: write
@@ -21,9 +32,12 @@ concurrency:
 jobs:
   package:
     name: Test, package, and draft release
+    # Clapboard requires macOS 26 / Xcode 26 (Swift 6.2) per AGENTS.md and
+    # README.md, matching ci.yml and the sibling AstroQore apps.
     runs-on: macos-26
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      CHANNEL_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || '' }}
 
     steps:
       - name: Check out tagged source
@@ -37,32 +51,63 @@ jobs:
           xcode-select -p
           swift --version
 
-      - name: swift test
-        timeout-minutes: 10
-        run: swift test
+      - name: Resolve release channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$CHANNEL_INPUT"
+          if [[ -z "$channel" ]]; then
+            # A pushed tag carries its own channel: v1.2.3-dev.45 is Dev,
+            # v1.2.3 is Main.
+            if [[ "$RELEASE_TAG" == v*-dev.* ]]; then
+              channel="dev"
+            else
+              channel="main"
+            fi
+          fi
+          if [[ "$channel" != "main" && "$channel" != "dev" ]]; then
+            echo "Unsupported release channel: $channel" >&2
+            exit 1
+          fi
+          echo "RELEASE_CHANNEL=$channel" >> "$GITHUB_ENV"
 
-      - name: Build and ad-hoc sign the release app
-        run: ./Scripts/build_app.sh release
+      - name: Fetch current shared appcast
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Merging into the live feed is what keeps the OTHER channel's head
+          # alive in the draft's appcast asset. Without it a Main release would
+          # ship a feed with no Dev item, and vice versa.
+          base_appcast="$RUNNER_TEMP/clapboard-appcast.xml"
+          if git ls-remote --exit-code --heads origin updates >/dev/null 2>&1; then
+            git fetch --no-tags origin \
+              refs/heads/updates:refs/remotes/origin/updates
+            git show refs/remotes/origin/updates:appcast.xml > "$base_appcast"
+            echo "CLAPBOARD_BASE_APPCAST=$base_appcast" >> "$GITHUB_ENV"
+          else
+            echo "No existing shared appcast; this release will seed it."
+          fi
+
+      - name: Build verified release assets
+        env:
+          # Scoped to this step only, passed to Sparkle over stdin, and never
+          # written to the checkout, the command line or the log.
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$SPARKLE_ED_PRIVATE_KEY" ]]; then
+            echo "SPARKLE_ED_PRIVATE_KEY is required for signed in-app updates." >&2
+            echo "See RELEASING.md for how to create it." >&2
+            exit 1
+          fi
+          ./Scripts/release_app.sh --channel "$RELEASE_CHANNEL" "$RELEASE_TAG"
 
       - name: Verify empty entitlements
         run: codesign -d --entitlements - .build/Clapboard.app
 
-      - name: Package release assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUT_DIR=".build/release"
-          mkdir -p "$OUT_DIR"
-          VERSION="${RELEASE_TAG#v}"
-          ZIP_NAME="Clapboard-${VERSION}-macOS.zip"
-
-          # ditto preserves the .app bundle structure (permissions, resource
-          # fork-free layout) correctly; a plain `zip -r` does not.
-          ditto -c -k --keepParent .build/Clapboard.app "$OUT_DIR/$ZIP_NAME"
-          ( cd "$OUT_DIR" && shasum -a 256 "$ZIP_NAME" > "$ZIP_NAME.sha256" )
-
-          echo "RELEASE_ZIP=$OUT_DIR/$ZIP_NAME" >> "$GITHUB_ENV"
-          echo "RELEASE_SHA=$OUT_DIR/$ZIP_NAME.sha256" >> "$GITHUB_ENV"
+      - name: Repo hygiene check
+        run: ./Scripts/check_repo_hygiene.sh
 
       - name: Create or update draft release
         env:
@@ -70,10 +115,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" \
-            "$RELEASE_ZIP" "$RELEASE_SHA" \
-            --title "Clapboard ${RELEASE_TAG#v}" \
-            --draft \
-            --generate-notes \
-            --verify-tag \
-            || gh release upload "$RELEASE_TAG" "$RELEASE_ZIP" "$RELEASE_SHA" --clobber
+          assets=(.build/release/*.zip .build/release/*.sha256 .build/release/appcast.xml)
+          release_title="Clapboard ${RELEASE_TAG#v}"
+          # --verify-tag fails the job rather than releasing from the wrong
+          # commit if the tag was force-moved after the run started.
+          release_flags=(--draft --generate-notes --verify-tag)
+          if [[ "$RELEASE_CHANNEL" == "dev" ]]; then
+            release_title="Clapboard ${RELEASE_TAG#v} (Dev)"
+            release_flags+=(--prerelease --latest=false)
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+              echo "Refusing to replace assets on a published release." >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            if [[ "$RELEASE_CHANNEL" == "dev" ]]; then
+              gh release edit "$RELEASE_TAG" --prerelease --latest=false
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              "${assets[@]}" \
+              --title "$release_title" \
+              "${release_flags[@]}"
+          fi

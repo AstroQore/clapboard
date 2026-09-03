@@ -34,6 +34,28 @@
 	<string>Clapboard captures your microphones and other audio inputs so it can align and mix them.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<!-- Sparkle. See RELEASING.md; Sources/ClapboardApp/AppUpdateController.swift
+	     refuses to start the updater while SUPublicEDKey is the placeholder. -->
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/AstroQore/clapboard/updates/appcast.xml</string>
+	<!-- PLACEHOLDER — replace with the output of Sparkle's generate_keys.
+	     Never commit the matching private key; see RELEASING.md step 1. -->
+	<key>SUPublicEDKey</key>
+	<string>REPLACE_ME_WITH_SPARKLE_PUBLIC_ED_KEY</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUShowReleaseNotes</key>
+	<true/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
