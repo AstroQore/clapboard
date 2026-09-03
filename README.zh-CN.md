@@ -21,9 +21,44 @@ USB / 无线接收器和虚拟设备（Loopback、Audio Hijack），把每一路
 | M4 带延迟补偿的 Audio Unit 宿主 | 进行中 |
 | M5 会话持久化、缺失设备处理 | 已完成 |
 
+## 安装与更新
+
+从 [最新 release][releases] 下载 `.zip`，解压后把 `Clapboard.app` 拖进 `/Applications`。
+
+Clapboard 是 **ad-hoc 签名、未经公证（notarize）** 的——这个项目背后没有 Apple Developer
+Program 会员——所以第一次打开必须**右键 › 打开**（或者到「系统设置 › 隐私与安全性」里放行）。
+直接双击会被 Gatekeeper 拦下。release 页面上和安装包并排的 `.sha256` 可以用来核对下载内容。
+
+### 更新
+
+Clapboard 通过 [Sparkle][sparkle] 自更新，有两条通道：
+
+| | |
+|---|---|
+| **Main** | 只有稳定版——默认 |
+| **Dev** | 预览版**加上**所有 Main 版本 |
+
+在 **Clapboard › Update Channel** 里选择通道，用 **Clapboard › Check for Updates…**
+手动检查。Clapboard 每天检查一次，安装前一定会先问，并且从不后台静默安装——混音器不能在
+一场直播进行到一半时把自己换掉。
+
+每个更新包都用 EdDSA 密钥签名，并且在**解压之前**就完成验证，这正是一个未公证的下载仍然
+可以放心接受的原因。公钥放在 `Resources/Info.plist` 里；私钥从不进入这个仓库。完整流程见
+`RELEASING.md`。
+
+**只要构建还是 ad-hoc 签名，就有一个绕不开的粗糙之处：** ad-hoc 签名是由二进制自身的哈希
+推导出来的，所以在 macOS 看来每次更新都是一个不同的 app。请预期**更新之后麦克风授权提示会
+重新弹出**——如果它没有弹出、而电平表却一直是静音，那说明 macOS 里留着一条旧的「已拒绝」
+记录：执行 `tccutil reset Microphone com.astroqore.Clapboard` 后重新启动。原因见
+`docs/PERMISSIONS.md`。
+
+[releases]: https://github.com/AstroQore/clapboard/releases
+[sparkle]: https://sparkle-project.org
+
 ## 构建
 
-需要 macOS 26 和 Xcode 26（Swift 6.2）。纯 SwiftPM 项目，没有 Xcode 工程文件。
+需要 macOS 26 和 Xcode 26（Swift 6.2）。纯 SwiftPM 项目，只有一个依赖：[Sparkle][sparkle]，
+锁定在一个确切版本，由 `Scripts/build_app.sh` 嵌入 bundle 并在 app 之前完成签名。
 
 ```sh
 swift build
@@ -127,7 +162,11 @@ coreaudiod 无法接受新客户端，直到它被重启（`sudo killall coreaud
 
 这个 app 是刻意不做沙盒、也不启用 hardened runtime 的：它需要在进程内宿主第三方 AUv2
 插件，而 library validation 会阻止这件事。`Resources/Clapboard.entitlements` 是刻意
-留空的。
+留空的。（Sparkle 自己的辅助可执行文件**确实**启用了 hardened runtime——它们是独立的
+二进制，永远不会宿主插件。）
+
+正式发布的构建同样是 ad-hoc 签名的，这也是为什么一次应用内更新会重新索取麦克风权限；
+见上面的「安装与更新」和 `RELEASING.md`。
 
 ## 目录结构
 
@@ -139,7 +178,10 @@ Sources/ClapboardCore/Sync    起始点检测、GCC-PHAT、拍手对齐器      
 Sources/ClapboardCore/AU      Audio Unit 目录与宿主                          (M4)
 Sources/ClapboardCore/Session JSON 会话文档                                  (M5)
 Sources/ClapboardApp          app 入口、控制器、视图
-Scripts/build_app.sh          打包 + 签名 .build/Clapboard.app
+Sources/ClapboardApp/AppUpdateController.swift  Sparkle 更新器与通道选择
+Scripts/build_app.sh          打包 + 签名 .build/Clapboard.app（含 Sparkle）
+Scripts/release_app.sh        为一个 tag 生成 zip + 校验和 + 已签名的 appcast 条目
+Scripts/generate_update_feed.sh  重建双通道共享 appcast
 ```
 
 ## 状态、贡献与许可
@@ -158,4 +200,4 @@ Scripts/build_app.sh          打包 + 签名 .build/Clapboard.app
 ## 许可证
 
 AGPL-3.0-only。完整文本见 `LICENSE`；本项目依赖的内容见 `THIRD_PARTY_NOTICES.md`
-（目前：除 Apple 系统框架外没有其它依赖）。
+——Sparkle（MIT），它会被一并打进 app bundle 里；除此之外没有 Apple 系统框架以外的依赖。

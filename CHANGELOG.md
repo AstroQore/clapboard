@@ -13,6 +13,30 @@ yet.
 
 ### Added
 
+- **In-app updates, on two Sparkle channels.** Clapboard now carries
+  [Sparkle](https://github.com/sparkle-project/Sparkle) (pinned to an exact
+  version, embedded in `Contents/Frameworks`, licensed in
+  `Resources/ThirdPartyLicenses/Sparkle.txt`) and offers **Clapboard › Check
+  for Updates…** plus a **Clapboard › Update Channel** choice of **Main**
+  (stable) or **Dev** (previews *plus* every Main release, because Sparkle
+  always includes its default channel). The channel maps onto Sparkle's
+  `allowedChannels` in `Sources/ClapboardApp/AppUpdateController.swift` and is
+  remembered in `UserDefaults`. Checks run once a day and always ask before
+  installing — a mixer must not replace itself during a live session. Every
+  archive is EdDSA-signed and verified before extraction
+  (`SUVerifyUpdateBeforeExtraction`), which is what makes an unnotarized
+  download safe to accept; a build whose `SUPublicEDKey` is still the shipped
+  placeholder refuses to start the updater at all and says so in the menu.
+- **A tag-driven release pipeline.** `Scripts/release_app.sh` builds, signs,
+  zips (`ditto`), checksums and produces the signed appcast item for one `v*`
+  tag on a chosen channel, refusing a tag that disagrees with `Info.plist`.
+  `Scripts/generate_update_feed.sh` rebuilds the shared feed from
+  already-published archives. `.github/workflows/release.yml` drafts the
+  GitHub Release; `.github/workflows/publish-update-feed.yml` reconstructs
+  both channel heads from the published releases and commits `appcast.xml` to
+  the machine-managed `updates` branch when a release is published, so a lost
+  or superseded workflow run cannot drop a feed entry. `RELEASING.md` has the
+  whole flow and the maintainer's key checklist.
 - **Projects**: Save As / Open / Open Recent / New over `.clapboard` files
   (the same JSON as the session, UTI `com.astroqore.clapboard.project`,
   declared in `Info.plist` so they open on a double-click). The one-second
@@ -153,6 +177,14 @@ yet.
   where Installer.app opens; the install itself, the `coreaudiod` restart and
   the buses appearing have not been run on a development machine, because
   installing needs the machine owner's administrator password.
-- No signed/notarized release build exists; see `SECURITY.md`.
+- No signed/notarized release build exists; see `SECURITY.md`. Releases are
+  ad-hoc signed, so a user has to right-click › Open the first time, and —
+  because an ad-hoc signature's identity is the binary's own hash — **every
+  in-app update re-prompts for the microphone**, or is silently denied if TCC
+  holds a stale entry (`docs/PERMISSIONS.md`).
+- In-app updates are wired but not yet live: `Resources/Info.plist` still
+  carries the `SUPublicEDKey` placeholder, and no release has been published,
+  so the `updates` branch that `SUFeedURL` points at does not exist yet. See
+  `RELEASING.md` § "Maintainer checklist".
 
 [Unreleased]: https://github.com/AstroQore/clapboard/commits/main

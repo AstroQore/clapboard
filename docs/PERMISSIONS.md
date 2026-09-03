@@ -60,6 +60,23 @@ Note that `tccutil reset` and the ad-hoc/identity distinction are about the
 **app's own build**, not about "asking the user for permission" in the
 product sense — there is no in-app way to route around it, by design.
 
+### An in-app update re-prompts too
+
+This is not only a development-machine problem. Released builds are ad-hoc
+signed as well (see `RELEASING.md` — there is no Developer ID certificate and
+no notarization), so **every Sparkle update changes the cdhash and therefore
+the identity TCC recognises**. After Clapboard updates itself, expect exactly
+the two outcomes above: the microphone prompt comes back, or — if TCC is
+holding a denied or stale entry for `com.astroqore.Clapboard` — access is
+refused silently and the engine captures zeros.
+
+There is no way to fix this from inside the app; a stable identity is the
+whole mechanism, and an ad-hoc signature does not have one. The user-facing
+remedy is the same `tccutil reset Microphone com.astroqore.Clapboard` followed
+by a relaunch, and it is written down in both READMEs' "Install and updates"
+section rather than left for someone to discover. It goes away the day
+releases are signed with a Developer ID certificate, and not before.
+
 ## Why the app is unsandboxed with an empty entitlements file
 
 `Resources/Clapboard.entitlements` is intentionally an empty `<dict/>`: no App
