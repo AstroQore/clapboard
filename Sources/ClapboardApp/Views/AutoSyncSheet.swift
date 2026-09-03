@@ -254,7 +254,7 @@ struct AutoSyncSheet: View {
 
                     SyncResultTable(
                         result: result,
-                        referenceLaneID: result.referenceLaneID,
+                        fitResidualSamples: result.fitResidualSamples,
                         verifications: session.verifications
                     )
 
@@ -355,7 +355,9 @@ struct AutoSyncSheet: View {
 
 private struct SyncResultTable: View {
     let result: SyncResult
-    let referenceLaneID: UUID?
+    /// How well every pairwise measurement agreed with one set of arrival
+    /// times. Shown instead of naming a reference lane: there isn't one.
+    let fitResidualSamples: Double?
     let verifications: [SyncVerification]
 
     private func milliseconds(_ samples: Double) -> Double {
@@ -379,9 +381,26 @@ private struct SyncResultTable: View {
         HStack(spacing: 8) {
             Text("Lane").frame(width: 150, alignment: .leading)
             Text("Arrival").frame(width: 78, alignment: .trailing)
-            Text("Delay").frame(width: 78, alignment: .trailing)
+            Text("Delay to add").frame(width: 78, alignment: .trailing)
             Text("Confidence").frame(width: 110, alignment: .leading)
-            Text("Verdict").frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 4) {
+                Text("Verdict")
+                Spacer(minLength: 0)
+                if let residual = fitResidualSamples, residual.isFinite {
+                    // The take's own cross-check, in place of naming a lane
+                    // everything was measured against: with three or more
+                    // lanes it is how far every pairwise measurement had to
+                    // bend to agree on one set of arrivals.
+                    Text(String(format: "pairs agree to %.2f samples", residual))
+                        .foregroundStyle(residual <= 1 ? Color.secondary : Color.orange)
+                        .help(
+                            "Every pair of lanes is measured on its own and the"
+                            + " arrival times are fitted to all of them at once."
+                            + " This is how much the measurements disagreed."
+                        )
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .font(.caption.weight(.semibold))
         .foregroundStyle(.secondary)
@@ -391,21 +410,15 @@ private struct SyncResultTable: View {
 
     private func row(_ lane: LaneSyncResult) -> some View {
         HStack(spacing: 8) {
-            HStack(spacing: 4) {
-                Text(lane.label)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if lane.laneID == referenceLaneID {
-                    Text("ref")
-                        .font(.caption2)
-                        .padding(.horizontal, 4)
-                        .background(.quaternary, in: Capsule())
-                        .help("Every arrival is measured against this lane.")
-                }
-            }
-            .frame(width: 150, alignment: .leading)
+            Text(lane.label)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: 150, alignment: .leading)
 
-            Text(lane.status.offsetSamples.map { String(format: "%+.2f ms", milliseconds($0)) } ?? "—")
+            // Arrivals are absolute within the take: the lane that heard the
+            // clap first reads 0.00 and nothing is ever negative. No lane is a
+            // reference, so none is labelled as one.
+            Text(lane.status.offsetSamples.map { String(format: "%.2f ms", milliseconds($0)) } ?? "—")
                 .font(.caption.monospacedDigit())
                 .frame(width: 78, alignment: .trailing)
 

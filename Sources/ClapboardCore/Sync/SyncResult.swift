@@ -175,8 +175,24 @@ public struct LaneSyncResult: Sendable {
 /// The result of analysing one take (`analyze`) or a group of takes
 /// (`analyzeMultiple`).
 public struct SyncResult: Sendable {
-    /// Lane every `offsetSamples` is measured against, `nil` when no lane
-    /// produced a usable transient.
+    /// Arrival of the clap per lane, in samples, with the earliest lane at 0.
+    /// Empty when the take failed.
+    public var arrivals: [UUID: Double] = [:]
+    /// Root mean square of the pairwise fit residuals, in samples. Nil when no
+    /// fit ran. This is the take's own consistency check: with three or more
+    /// lanes it says whether every pair agrees with one set of arrival times.
+    public var fitResidualSamples: Double?
+    /// Root mean square of `tau_ij + tau_jk + tau_ki` over the surviving
+    /// triangles. Nil for a two-lane take, which has nothing to cross-check.
+    public var triangleResidualSamples: Double?
+    /// Every pairwise measurement the fit used, for the measurement detail.
+    public var pairs: [PairObservation] = []
+    /// Pairs the fit rejected as inconsistent with the rest.
+    public var droppedPairs: [PairObservation] = []
+
+    /// Legacy: the lane the old single-reference estimator measured against.
+    /// Arrivals no longer depend on one lane, so this is only kept for
+    /// diagnostics and must not be shown to the user as a privileged lane.
     public let referenceLaneID: UUID?
     public let lanes: [LaneSyncResult]
     public let sampleRate: Double

@@ -4,6 +4,44 @@ From each lane's *pre-delay* recording of a hand clap, work out when the clap
 reached that lane and what delay lines it up with the lane that heard it last.
 No Core Audio, no real-time code, no UI; `ClapAligner.analyze` is pure.
 
+## How a take is measured
+
+There is no reference lane. A clap carries no clock, so only *differences*
+between lanes are observable, and picking one lane to measure everyone else
+against throws away most of the evidence and shows the user a negative
+arrival for whichever lane happened to hear it first.
+
+Instead every pair is measured on its own, and the arrivals are fitted to all
+the pairs at once:
+
+1. **Onset** per lane: the dominant transient of the whole take
+   (`OnsetDetector`) — the loudest 1 ms window, accepted only when it stands
+   `minDominanceDB` above the take's own median level.
+2. **Bracket** per pair: `EnvelopeCorrelator` correlates the two lanes'
+   log-energy envelopes over a span around their onsets. Envelopes survive
+   clipping and two microphones with nothing in common but the room, so this
+   is what carries a lane driven too hot.
+3. **Refine** per pair: band-limited GCC-PHAT (`GCCPHAT`) inside a
+   `waveformAgreementSeconds` bracket around the envelope answer. The waveform
+   has the final say, because *every* clap has a similar energy envelope and
+   only the same clap shares a waveform: this is the gate that stops one
+   lane's door slam being tied to another lane's clap. Its peak ratio is
+   judged against `minBracketedPeakRatio`, which is lower than the old
+   whole-window `minPeakRatio` precisely because the bracket has already
+   removed the alternatives.
+4. **Fit**: `PairwiseAlignment` solves `t_a - t_b = tau_ab` by weighted least
+   squares over the graph Laplacian, gauge-fixed so the earliest lane is 0 and
+   no arrival is negative. Outliers are found by leaving one pair out and
+   refitting, not by how far a residual sits from the spread of the others: a
+   least-squares fit smears one bad measurement across every pair that shares
+   a lane with it, so a median-based sigma calls all of them normal. A pair
+   that holds the graph together is kept even when it fits badly, and its
+   disagreement shows up in the residual instead.
+5. **Report**: the fit residual RMS is the take's honest confidence, and
+   triangle sums (`tau_ij + tau_jk + tau_ki`, which must vanish) are an
+   independent check that does not depend on the fit at all. Two lanes have to
+   agree before any delay is written.
+
 ## Pipeline
 
 1. **Onset** (`OnsetDetector`) — 1 ms RMS envelope, hop 0.25 ms, over the whole
