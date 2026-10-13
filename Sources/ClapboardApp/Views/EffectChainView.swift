@@ -3,8 +3,8 @@ import SwiftUI
 
 /// One strip's effect chain, as chips.
 ///
-/// Click a chip to bypass it, double-click to open the plug-in's own editor,
-/// and use the chip's menu to reorder or remove it.
+/// Each chip has a power button that bypasses the plug-in, a name that opens
+/// its own editor, and a menu to reorder or remove it.
 ///
 /// Laid out as a row in the row-based mixer and as a column in a console strip;
 /// `axis` is the only difference, so the two never drift apart.
@@ -137,7 +137,13 @@ private struct LanePDCReadout: View {
     }
 }
 
-/// One plug-in.
+/// One plug-in: a power button, its name, and its latency.
+///
+/// The power button is the bypass switch and nothing else is — the same shape
+/// as an insert slot on a hardware console or in a DAW, where the on/off
+/// control is a thing you can see and point at rather than a gesture you have
+/// to know. The name opens the plug-in's own editor. The context menu repeats
+/// both and adds reorder and remove; `⌫` removes.
 private struct EffectChipView: View {
     let engine: AudioEngine
     let effect: EffectConfig
@@ -157,33 +163,14 @@ private struct EffectChipView: View {
 
     private var latency: Int { engine.effectLatencySamples(id: effect.id) }
 
-    var body: some View {
-        chip
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
-            .background(background, in: Capsule())
-            .overlay {
-                Capsule().strokeBorder(
-                    effect.isAvailable ? Color.clear : Color.orange.opacity(0.6))
-            }
-            .foregroundStyle(foreground)
-            .help(helpText)
-            .modifier(EffectChipInteraction(engine: engine, effect: effect, index: index,
-                                            count: count, hovering: $hovering))
-    }
+    /// Running: available and not bypassed. Everything the chip's look says
+    /// follows from this one bit.
+    private var isActive: Bool { effect.isAvailable && !effect.bypass }
 
-    private var chip: some View {
-        HStack(spacing: 4) {
-            Text(shortName)
-                .font(.caption)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if latency > 0, !effect.bypass {
-                Text("\(latency)sp")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-            }
+    var body: some View {
+        HStack(spacing: 5) {
+            powerButton
+            nameButton
             if fillsWidth { Spacer(minLength: 0) }
             if hovering {
                 Button {
@@ -196,69 +183,94 @@ private struct EffectChipView: View {
                 .help("Remove")
             }
         }
+        .padding(.leading, 5)
+        .padding(.trailing, 7)
+        .padding(.vertical, 3)
+        .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+        .background(background, in: Capsule())
+        .overlay {
+            Capsule().strokeBorder(
+                effect.isAvailable ? Color.clear : Color.orange.opacity(0.6))
+        }
+        .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+        .onHover { hovering = $0 }
+        .contextMenu {
+            Button(effect.bypass ? "Enable" : "Bypass") {
+                engine.setEffectBypass(id: effect.id, !effect.bypass)
+            }
+            .disabled(!effect.isAvailable)
+            Button("Open Editor") { engine.openEffectWindow(id: effect.id) }
+                .disabled(!effect.isAvailable)
+            Divider()
+            Button("Move Earlier") { engine.moveEffect(id: effect.id, to: index - 1) }
+                .disabled(index == 0)
+            Button("Move Later") { engine.moveEffect(id: effect.id, to: index + 1) }
+                .disabled(index >= count - 1)
+            Divider()
+            Button("Remove", role: .destructive) { engine.removeEffect(id: effect.id) }
+        }
+        .onDeleteCommand { engine.removeEffect(id: effect.id) }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(effect.displayName)
+    }
+
+    /// The bypass switch. Lit and filled while the plug-in runs, hollow and
+    /// dim while it is bypassed; disabled, not hidden, for a plug-in that is
+    /// not installed, so the chip keeps its shape.
+    private var powerButton: some View {
+        Button {
+            engine.setEffectBypass(id: effect.id, !effect.bypass)
+        } label: {
+            Image(systemName: isActive ? "power.circle.fill" : "power.circle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(isActive ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .buttonStyle(.borderless)
+        .disabled(!effect.isAvailable)
+        .help(powerHelp)
+        .accessibilityLabel("Enabled")
+        .accessibilityValue(effect.bypass ? "off" : "on")
+    }
+
+    private var nameButton: some View {
+        Button {
+            engine.openEffectWindow(id: effect.id)
+        } label: {
+            HStack(spacing: 4) {
+                Text(shortName)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .strikethrough(effect.bypass && effect.isAvailable, color: .secondary)
+                if latency > 0, isActive {
+                    Text("\(latency)sp")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!effect.isAvailable)
+        .help(nameHelp)
     }
 
     private var background: AnyShapeStyle {
-        if !effect.isAvailable { return AnyShapeStyle(.quaternary) }
+        isActive ? AnyShapeStyle(Color.accentColor.opacity(0.25)) : AnyShapeStyle(.quaternary)
+    }
+
+    private var powerHelp: String {
+        if let reason = effect.unavailableReason { return "\(effect.displayName) — \(reason)" }
         return effect.bypass
-            ? AnyShapeStyle(.quaternary)
-            : AnyShapeStyle(Color.accentColor.opacity(0.25))
+            ? "Bypassed — click to enable \(effect.displayName)"
+            : "On — click to bypass \(effect.displayName)"
     }
 
-    private var foreground: AnyShapeStyle {
-        effect.isAvailable && !effect.bypass
-            ? AnyShapeStyle(.primary)
-            : AnyShapeStyle(.secondary)
-    }
-
-    private var helpText: String {
+    private var nameHelp: String {
         if let reason = effect.unavailableReason { return "\(effect.displayName) — \(reason)" }
         return "\(effect.displayName)\(effect.bypass ? " (bypassed)" : "")"
-            + " · \(latency) samples latency"
-            + " · click to bypass, double-click for its editor"
-    }
-}
-
-/// The click, hover and menu behaviour of a chip.
-///
-/// Split out from the chip's appearance so the two can be read separately;
-/// every chain — lane or bus — gets it, because every chain is editable.
-private struct EffectChipInteraction: ViewModifier {
-    let engine: AudioEngine
-    let effect: EffectConfig
-    let index: Int
-    let count: Int
-    @Binding var hovering: Bool
-
-    func body(content: Content) -> some View {
-        content
-            .onHover { hovering = $0 }
-            // Order matters: SwiftUI matches the higher count first, so the
-            // single-click bypass never swallows a double-click.
-            .onTapGesture(count: 2) {
-                guard effect.isAvailable else { return }
-                engine.openEffectWindow(id: effect.id)
-            }
-            .onTapGesture {
-                guard effect.isAvailable else { return }
-                engine.setEffectBypass(id: effect.id, !effect.bypass)
-            }
-            .contextMenu {
-                Button("Open Editor") { engine.openEffectWindow(id: effect.id) }
-                    .disabled(!effect.isAvailable)
-                Button(effect.bypass ? "Enable" : "Bypass") {
-                    engine.setEffectBypass(id: effect.id, !effect.bypass)
-                }
-                .disabled(!effect.isAvailable)
-                Divider()
-                Button("Move Earlier") { engine.moveEffect(id: effect.id, to: index - 1) }
-                    .disabled(index == 0)
-                Button("Move Later") { engine.moveEffect(id: effect.id, to: index + 1) }
-                    .disabled(index >= count - 1)
-                Divider()
-                Button("Remove", role: .destructive) { engine.removeEffect(id: effect.id) }
-            }
-            .onDeleteCommand { engine.removeEffect(id: effect.id) }
+            + " · \(latency) samples latency · click to open its editor"
     }
 }
 

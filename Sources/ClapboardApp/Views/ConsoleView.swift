@@ -22,6 +22,18 @@ import SwiftUI
 /// views that do not take the reading, so SwiftUI compares their unchanged
 /// inputs and skips them. Everything that can be computed per change —
 /// effective mute/solo above all — is computed outside the timeline closure.
+///
+/// ## Why the reading travels inside the `ForEach` data
+///
+/// A `ForEach` calls its row closure when an element is new or has changed —
+/// not on every evaluation of the view around it. A meter read *inside* that
+/// closure is therefore taken when the lane list changes and never again: the
+/// timeline fires thirty times a second, the closure that owns it runs, and
+/// every strip keeps the reading it was built with. That is exactly how the
+/// console looked before: faders and chips alive, meters frozen at the value
+/// they had when a lane was last added. So each frame builds one small
+/// `LaneStrip`/`BusStrip` value per strip, reading carried along, and hands
+/// *those* to the `ForEach`; a changed element is what makes a row re-render.
 struct ConsoleView: View {
     let engine: AudioEngine
     let registry: AudioDeviceRegistry
@@ -55,6 +67,22 @@ struct ConsoleView: View {
 
     // MARK: - Strips
 
+    /// One lane strip's per-frame inputs. See "Why the reading travels inside
+    /// the `ForEach` data" above.
+    private struct LaneStrip: Identifiable, Equatable {
+        let lane: LaneConfig
+        let audible: Bool
+        let meter: MeterReading
+        var id: UUID { lane.id }
+    }
+
+    private struct BusStrip: Identifiable, Equatable {
+        let bus: BusConfig
+        let audible: Bool
+        let meter: MeterReading
+        var id: UUID { bus.id }
+    }
+
     @ViewBuilder
     private func strips(faderHeight: CGFloat) -> some View {
         // Computed here, outside the timeline closure: solo scope changes when
@@ -75,18 +103,33 @@ struct ConsoleView: View {
         effective: (lanes: [UUID: Bool], buses: [UUID: Bool]),
         faderHeight: CGFloat
     ) -> some View {
-        ScrollView(.horizontal) {
+        // Read every meter here, once per frame, outside the `ForEach` closures.
+        let laneStrips = engine.lanes.map { lane in
+            LaneStrip(
+                lane: lane,
+                audible: effective.lanes[lane.id] ?? lane.enabled,
+                meter: isLive ? engine.meter(laneID: lane.id) : .silent
+            )
+        }
+        let busStrips = engine.consoleBusOrder.map { bus in
+            BusStrip(
+                bus: bus,
+                audible: effective.buses[bus.id] ?? !bus.muted,
+                meter: isLive ? engine.busMeter(id: bus.id) : .silent
+            )
+        }
+        return ScrollView(.horizontal) {
             HStack(alignment: .top, spacing: ConsoleMetrics.stripSpacing) {
-                if engine.lanes.isEmpty {
+                if laneStrips.isEmpty {
                     noLanesColumn
                 }
-                ForEach(engine.lanes) { lane in
+                ForEach(laneStrips) { strip in
                     LaneStripView(
                         engine: engine,
                         registry: registry,
-                        lane: lane,
-                        audible: effective.lanes[lane.id] ?? lane.enabled,
-                        meter: isLive ? engine.meter(laneID: lane.id) : .silent,
+                        lane: strip.lane,
+                        audible: strip.audible,
+                        meter: strip.meter,
                         isLive: isLive,
                         faderHeight: faderHeight
                     )
@@ -95,13 +138,13 @@ struct ConsoleView: View {
 
                 sectionDivider
 
-                ForEach(engine.consoleBusOrder) { bus in
+                ForEach(busStrips) { strip in
                     BusStripView(
                         engine: engine,
                         registry: registry,
-                        bus: bus,
-                        audible: effective.buses[bus.id] ?? !bus.muted,
-                        meter: isLive ? engine.busMeter(id: bus.id) : .silent,
+                        bus: strip.bus,
+                        audible: strip.audible,
+                        meter: strip.meter,
                         isLive: isLive,
                         faderHeight: faderHeight
                     )
