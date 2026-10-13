@@ -6,6 +6,27 @@
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
 	<string>Clapboard</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>clapboard</string>
+			</array>
+			<key>CFBundleTypeIconFile</key>
+			<string>AppIcon</string>
+			<key>CFBundleTypeName</key>
+			<string>Clapboard Project</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.astroqore.clapboard.project</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>Clapboard</string>
 	<key>CFBundleIconFile</key>
@@ -21,7 +42,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>NSAudioCaptureUsageDescription</key>
@@ -34,8 +55,6 @@
 	<string>Clapboard captures your microphones and other audio inputs so it can align and mix them.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
-	<!-- Sparkle. See RELEASING.md; Sources/ClapboardApp/AppUpdateController.swift
-	     refuses to start the updater while SUPublicEDKey is the placeholder. -->
 	<key>SUAllowsAutomaticUpdates</key>
 	<false/>
 	<key>SUAutomaticallyUpdate</key>
@@ -46,8 +65,6 @@
 	<false/>
 	<key>SUFeedURL</key>
 	<string>https://raw.githubusercontent.com/AstroQore/clapboard/updates/appcast.xml</string>
-	<!-- PLACEHOLDER — replace with the output of Sparkle's generate_keys.
-	     Never commit the matching private key; see RELEASING.md step 1. -->
 	<key>SUPublicEDKey</key>
 	<string>2xO9t72QGW9qpbToOTBayktr2QB70PIvFMJJTY+fyUk=</string>
 	<key>SUScheduledCheckInterval</key>
@@ -59,16 +76,16 @@
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
-			<key>UTTypeIdentifier</key>
-			<string>com.astroqore.clapboard.project</string>
-			<key>UTTypeDescription</key>
-			<string>Clapboard Project</string>
 			<key>UTTypeConformsTo</key>
 			<array>
 				<string>public.json</string>
 			</array>
+			<key>UTTypeDescription</key>
+			<string>Clapboard Project</string>
 			<key>UTTypeIconFile</key>
 			<string>AppIcon</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.astroqore.clapboard.project</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
@@ -80,27 +97,6 @@
 					<string>application/json</string>
 				</array>
 			</dict>
-		</dict>
-	</array>
-	<key>CFBundleDocumentTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeName</key>
-			<string>Clapboard Project</string>
-			<key>CFBundleTypeRole</key>
-			<string>Editor</string>
-			<key>LSHandlerRank</key>
-			<string>Owner</string>
-			<key>LSItemContentTypes</key>
-			<array>
-				<string>com.astroqore.clapboard.project</string>
-			</array>
-			<key>CFBundleTypeExtensions</key>
-			<array>
-				<string>clapboard</string>
-			</array>
-			<key>CFBundleTypeIconFile</key>
-			<string>AppIcon</string>
 		</dict>
 	</array>
 </dict>
