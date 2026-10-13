@@ -244,8 +244,9 @@ Four things the console does that are worth stating explicitly:
   the engine, republish, and dirty the session. Every setter in a strip
   compares first.
 
-A bus strip's effect chips are the same control a lane's are: click to bypass,
-double-click for the plug-in's own editor, context menu to reorder or remove,
+A bus strip's effect chips are the same control a lane's are: a power button
+that bypasses, a name that opens the plug-in's own editor, a context menu to
+reorder or remove,
 and a working `+` that opens the plug-in picker (headed with the strip's own
 name). Nothing about the Master bus's chain is special any more — the strip
 draws it through `EffectChainView` with the subject `.bus(id)`, master

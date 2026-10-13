@@ -11,6 +11,26 @@ a release.
 Everything below exists in `main` today; nothing has been tagged as a release
 yet.
 
+### Fixed
+
+- **Console meters are live again.** The console's strips read their meters
+  inside the `ForEach` row closure, and SwiftUI only calls that closure when
+  a row's element changes — so every strip kept the reading it was built with
+  and the meters froze at whatever they said when a lane was last added, while
+  the row-based mixer (one timer per row) stayed live. Each frame now reads
+  every meter once and carries the reading *in* the `ForEach` data
+  (`ConsoleView.LaneStrip`/`BusStrip`), which is what makes a row re-render.
+
+### Changed
+
+- **Effect chips have a power button.** Bypass used to be a single click on
+  the chip, with a double-click for the editor — a gesture there was no way to
+  see. Every chip now carries a power switch at its left edge (filled and
+  tinted while the plug-in runs, hollow and dim while bypassed, the name
+  struck through), the name itself opens the plug-in's editor, and the
+  context menu still offers both. Bypass behaviour in the engine is unchanged:
+  still a crossfaded host pass-through that drops the plug-in's latency.
+
 ### Added
 
 - **In-app updates, on two Sparkle channels.** Clapboard now carries

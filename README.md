@@ -121,9 +121,10 @@ bundle identifier, and a bare executable has none.
 
 Every lane has an Audio Unit chain — after the delay line, before the fader —
 and the master bus has one of its own, after the sum and before the master
-gain. Chips under a lane's controls are the chain: click one to bypass it,
-double-click for the plug-in's own editor, right-click to reorder or remove,
-`+` to insert. Editing a chain while the mix is running is a graph snapshot
+gain. Chips under a lane's controls are the chain: the power button on a chip
+bypasses it (lit while the plug-in runs, hollow while it is bypassed), the name
+opens the plug-in's own editor, right-click to reorder or remove, `+` to
+insert. Editing a chain while the mix is running is a graph snapshot
 swap, the same click-free mechanism adding a lane uses, and bypass is
 crossfaded over 10 ms rather than switched.
 
